@@ -79,7 +79,7 @@ def index():
                 "event_url": "/event/hmailserver",
                 "manual_url": "/sync/weekly_report",
                 "method": "POST",
-                "description": "hMailServer OnDeliverMessage -> 本地队列 -> SeedDMS",
+                "description": "hMailServer OnAcceptMessage -> 本地队列 -> SeedDMS",
             },
         },
     }), 200
@@ -118,7 +118,7 @@ def webhook_handler():
 
 @app.route("/event/hmailserver", methods=["POST"])
 def hmailserver_event_handler():
-    """hMailServer EventHandlers.vbs 的轻量通知入口，只唤醒本地队列消费者。"""
+    """EventHandlers.vbs 的轻量通知入口，只唤醒本地队列消费者。"""
     config = get_service_config("weekly_report_sync")
     event_cfg = config.get("hmail_event", {})
 
@@ -172,7 +172,7 @@ def trigger_weekly_report_sync():
 
 
 def start_weekly_report_background_worker():
-    """后台消费本地 Event 队列；hMailServer 事件可立即唤醒，超时则用于失败重试。"""
+    """后台消费本地 Event 队列；hMailServer 事件立即唤醒，超时仅用于失败重试。"""
     report_cfg = get_service_config("weekly_report_sync")
     event_cfg = report_cfg.get("hmail_event", {})
     if not event_cfg.get("enabled", True):
