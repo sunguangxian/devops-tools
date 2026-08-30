@@ -1,17 +1,12 @@
 # -*- coding: utf-8 -*-
-"""
-DevOps 统一服务 (Unified Automation Server)
-将 Git-Redmine Webhook 同步与周报邮件自动归档整合为一个统一常驻后台服务。
-"""
+"""DevOps 统一服务：Git-Redmine Webhook + hMailServer Event 邮件归档。"""
 
 import hmac
 import sys
 import threading
-import time
 from datetime import datetime
 from pathlib import Path
 
-# 确保项目根目录在 sys.path 中
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -23,7 +18,7 @@ from common.config_loader import get_service_config
 from common.logger import setup_logger
 from services.git_redmine_sync.core import process_webhook
 from services.health import probe_dependencies
-from services.weekly_report_sync.core import sync_once
+from services.weekly_report_sync.core import get_pending_queue_count, sync_once
 
 logger = setup_logger(
     name="unified_server",
@@ -34,6 +29,7 @@ app = Flask(__name__)
 
 _worker_lock = threading.Lock()
 _worker_thread = None
+_queue_wakeup = threading.Event()
 _worker_state = {
     "last_started": None,
     "last_completed": None,
@@ -47,21 +43,29 @@ def _utc_now() -> str:
 
 
 def get_worker_health():
-    """返回周报后台线程的存活状态和最近一次运行结果。"""
     with _worker_lock:
         state = dict(_worker_state)
         state["alive"] = bool(_worker_thread and _worker_thread.is_alive())
+    try:
+        state["pending_events"] = get_pending_queue_count(
+            get_service_config("weekly_report_sync")
+        )
+    except Exception:
+        state["pending_events"] = None
     state["ok"] = state["alive"] and not state["last_error"]
     return state
 
 
-# ------------------------------------------------------------------------------
-# Web 路由
-# ------------------------------------------------------------------------------
+def _valid_api_key(provided_key: str, expected_key: str) -> bool:
+    return bool(
+        provided_key
+        and expected_key
+        and hmac.compare_digest(str(provided_key), str(expected_key))
+    )
+
 
 @app.route("/", methods=["GET"])
 def index():
-    """服务主页概览。"""
     return jsonify({
         "system": "DevOps & Server Automation Server",
         "status": "running",
@@ -72,9 +76,10 @@ def index():
                 "description": "GitLab/Gitea Webhook -> Redmine 问题状态同步",
             },
             "weekly_report_sync": {
-                "trigger_url": "/sync/weekly_report",
+                "event_url": "/event/hmailserver",
+                "manual_url": "/sync/weekly_report",
                 "method": "POST",
-                "description": "hMailServer 邮件监听 -> SeedDMS 知识库自动备份",
+                "description": "hMailServer OnDeliverMessage -> 本地队列 -> SeedDMS",
             },
         },
     }), 200
@@ -82,14 +87,12 @@ def index():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """检查后台任务状态及 IMAP、SeedDMS、Redmine 的实际连通性。"""
     git_cfg = get_service_config("git_redmine_sync")
     report_cfg = get_service_config("weekly_report_sync")
     timeout = float(git_cfg.get("server", {}).get("health_timeout_seconds", 5))
     dependencies = probe_dependencies(git_cfg, report_cfg, timeout=timeout)
     worker = get_worker_health()
     healthy = worker["ok"] and all(item["ok"] for item in dependencies.values())
-
     return jsonify({
         "status": "healthy" if healthy else "unhealthy",
         "worker": worker,
@@ -99,7 +102,6 @@ def health_check():
 
 @app.route("/webhook", methods=["POST"])
 def webhook_handler():
-    """接收 GitLab / Gitea Webhook 并同步至 Redmine。"""
     try:
         data = request.get_json(force=True, silent=True)
         if not data:
@@ -114,9 +116,34 @@ def webhook_handler():
         return "Internal error handled", 200
 
 
+@app.route("/event/hmailserver", methods=["POST"])
+def hmailserver_event_handler():
+    """hMailServer EventHandlers.vbs 的轻量通知入口，只唤醒本地队列消费者。"""
+    config = get_service_config("weekly_report_sync")
+    event_cfg = config.get("hmail_event", {})
+
+    if not event_cfg.get("enabled", True):
+        return jsonify({"status": "disabled"}), 403
+
+    allow_remote = bool(event_cfg.get("allow_remote", False))
+    remote_addr = request.remote_addr or ""
+    if not allow_remote and remote_addr not in {"127.0.0.1", "::1"}:
+        logger.warning(f"拒绝非本机 hMailServer Event 请求: {remote_addr}")
+        return jsonify({"status": "error", "message": "local requests only"}), 403
+
+    expected_key = str(event_cfg.get("api_key", "")).strip()
+    provided_key = request.headers.get("X-API-Key", "")
+    if not _valid_api_key(provided_key, expected_key):
+        logger.warning("收到未授权的 hMailServer Event 请求")
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    _queue_wakeup.set()
+    return jsonify({"status": "accepted"}), 202
+
+
 @app.route("/sync/weekly_report", methods=["POST"])
 def trigger_weekly_report_sync():
-    """通过受保护的 HTTP POST 接口手工触发一次周报归档。"""
+    """手工立即消费一次 hMailServer 本地事件队列。"""
     try:
         config = get_service_config("weekly_report_sync")
         if not config:
@@ -127,51 +154,39 @@ def trigger_weekly_report_sync():
             return jsonify({"status": "error", "message": "手工触发接口已禁用"}), 403
 
         expected_key = str(trigger_cfg.get("api_key", "")).strip()
-        if not expected_key:
-            logger.error("manual_trigger.api_key 未配置，拒绝开放周报手工触发接口")
-            return jsonify({
-                "status": "error",
-                "message": "手工触发接口未配置 API Key",
-            }), 503
-
         provided_key = request.headers.get("X-API-Key", "")
-        if not provided_key or not hmac.compare_digest(provided_key, expected_key):
+        if not _valid_api_key(provided_key, expected_key):
             logger.warning("收到未授权的周报手工触发请求")
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
         archived = sync_once(config)
         return jsonify({
             "status": "success",
-            "message": f"周报扫描归档完成，本次共处理归档 {archived} 个文件",
+            "message": f"Event 队列处理完成，本次归档 {archived} 个文件",
             "archived_count": archived,
+            "pending_events": get_pending_queue_count(config),
         }), 200
     except Exception as exc:
-        logger.error(f"手动触发周报同步异常: {exc}", exc_info=True)
+        logger.error(f"手动处理周报 Event 队列异常: {exc}", exc_info=True)
         return jsonify({"status": "error", "message": str(exc)}), 500
 
 
-# ------------------------------------------------------------------------------
-# 后台周报邮件监听线程
-# ------------------------------------------------------------------------------
-
 def start_weekly_report_background_worker():
-    """启动周报邮件监听后台守护线程。"""
+    """后台消费本地 Event 队列；hMailServer 事件可立即唤醒，超时则用于失败重试。"""
     report_cfg = get_service_config("weekly_report_sync")
-    mail_cfg = report_cfg.get("mail_monitor", {})
-    username = mail_cfg.get("username", "")
-
-    if not username:
-        logger.info("未配置周报邮箱账号 (username 为空)，周报后台监听线程未启用")
+    event_cfg = report_cfg.get("hmail_event", {})
+    if not event_cfg.get("enabled", True):
+        logger.info("hMailServer Event 邮件归档已禁用")
         return
 
-    interval = int(mail_cfg.get("poll_interval_seconds", 60))
+    retry_interval = max(int(event_cfg.get("retry_interval_seconds", 30)), 1)
     logger.info(
-        f"正在启动周报邮件监听后台线程 (监控账号: {username}, 轮询间隔: {interval}s)..."
+        "正在启动 hMailServer Event 队列消费者 (失败重试间隔: %ss, 当前待处理: %s)",
+        retry_interval,
+        get_pending_queue_count(report_cfg),
     )
 
     def worker_loop():
-        # 启动时稍作延迟，避开 Flask 初始化高峰
-        time.sleep(3)
         while True:
             with _worker_lock:
                 _worker_state["last_started"] = _utc_now()
@@ -185,25 +200,22 @@ def start_weekly_report_background_worker():
                 with _worker_lock:
                     _worker_state["last_completed"] = _utc_now()
                     _worker_state["last_error"] = str(exc)
-                logger.error(f"周报监听后台线程轮询异常: {exc}", exc_info=True)
-            time.sleep(interval)
+                logger.error(f"hMailServer Event 队列处理异常: {exc}", exc_info=True)
+
+            _queue_wakeup.wait(timeout=retry_interval)
+            _queue_wakeup.clear()
 
     global _worker_thread
     _worker_thread = threading.Thread(
         target=worker_loop,
-        name="WeeklyReportWorker",
+        name="HMailEventWorker",
         daemon=True,
     )
     _worker_thread.start()
-    logger.info("周报邮件监听后台线程启动成功")
+    logger.info("hMailServer Event 队列消费者启动成功")
 
-
-# ------------------------------------------------------------------------------
-# 统一服务主入口
-# ------------------------------------------------------------------------------
 
 def main():
-    """启动统一合并服务。"""
     git_cfg = get_service_config("git_redmine_sync")
     server_cfg = git_cfg.get("server", {})
     host = server_cfg.get("host", "0.0.0.0")
@@ -217,7 +229,8 @@ def main():
     start_weekly_report_background_worker()
 
     logger.info(
-        f"HTTP 服务已就绪: http://{host}:{port} (支持 /webhook 与 /sync/weekly_report)"
+        f"HTTP 服务已就绪: http://{host}:{port} "
+        "(支持 /webhook、/event/hmailserver、/sync/weekly_report)"
     )
     from waitress import serve
 
