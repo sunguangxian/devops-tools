@@ -1,11 +1,8 @@
 ' hMailServer EventHandlers.vbs 示例
-' 用途：在 OnDeliverMessage 中复制当前邮件 .eml 到 devops-tools 本地队列，
+' 用途：在 OnDeliverMessage 中复制当前邮件快照到 devops-tools 本地队列，
 '       然后通知统一服务立即消费队列。
 '
-' 部署前请修改下面三个常量：
-'   DEVOPS_QUEUE_DIR  - 必须与 weekly_report_sync.yaml 的 hmail_event.queue_dir 指向同一目录
-'   DEVOPS_EVENT_URL  - devops-tools 本机 HTTP 地址
-'   DEVOPS_EVENT_KEY  - 必须与 weekly_report_sync.yaml 的 hmail_event.api_key 一致
+' 部署前请修改下面三个常量。
 
 Const DEVOPS_QUEUE_DIR = "C:\server-service\devops-tools\data\mail_event_queue"
 Const DEVOPS_EVENT_URL = "http://127.0.0.1:5000/event/hmailserver"
@@ -27,7 +24,7 @@ Sub EnsureFolder(ByVal folderPath)
     End If
 End Sub
 
-Function BuildQueueFileName(ByVal messageId)
+Function BuildQueueBaseName(ByVal messageId)
     Dim nowValue, stamp
     nowValue = Now
     stamp = Year(nowValue) _
@@ -38,7 +35,7 @@ Function BuildQueueFileName(ByVal messageId)
         & Right("0" & Minute(nowValue), 2) _
         & Right("0" & Second(nowValue), 2)
 
-    BuildQueueFileName = CStr(messageId) & "_" & stamp & ".eml"
+    BuildQueueBaseName = CStr(messageId) & "_" & stamp
 End Function
 
 Sub NotifyDevOpsService()
@@ -66,22 +63,37 @@ End Sub
 Sub OnDeliverMessage(oMessage)
     On Error Resume Next
 
-    Dim fso, destinationPath
+    Dim fso, baseName, tempPath, finalPath
     EnsureFolder DEVOPS_QUEUE_DIR
 
     Set fso = CreateObject("Scripting.FileSystemObject")
-    destinationPath = DEVOPS_QUEUE_DIR & "\" & BuildQueueFileName(oMessage.ID)
+    baseName = BuildQueueBaseName(oMessage.ID)
+    tempPath = DEVOPS_QUEUE_DIR & "\" & baseName & ".tmp"
+    finalPath = DEVOPS_QUEUE_DIR & "\" & baseName & ".eml"
 
-    ' 先复制快照。即使 Python 服务暂时不可用，.eml 仍留在队列中，服务恢复后可继续处理。
-    fso.CopyFile oMessage.Filename, destinationPath, True
+    ' 先完整复制到 .tmp，再原子式发布为 .eml。
+    ' Python 只扫描 *.eml，因此不会读到复制到一半的邮件。
+    If fso.FileExists(tempPath) Then fso.DeleteFile tempPath, True
+    fso.CopyFile oMessage.Filename, tempPath, True
 
     If Err.Number <> 0 Then
         EventLog.Write "DevOps mail event copy failed: " & Err.Description _
             & "; source=" & oMessage.Filename _
-            & "; target=" & destinationPath
+            & "; target=" & tempPath
         Err.Clear
     Else
-        NotifyDevOpsService
+        If fso.FileExists(finalPath) Then fso.DeleteFile finalPath, True
+        fso.MoveFile tempPath, finalPath
+
+        If Err.Number <> 0 Then
+            EventLog.Write "DevOps mail event publish failed: " & Err.Description _
+                & "; temp=" & tempPath _
+                & "; target=" & finalPath
+            Err.Clear
+        Else
+            ' 即使 HTTP 通知失败，.eml 仍留在队列中，消费者会按 retry_interval_seconds 重试。
+            NotifyDevOpsService
+        End If
     End If
 
     Set fso = Nothing
