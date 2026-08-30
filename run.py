@@ -53,7 +53,7 @@ SERVICES = {
 }
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="DevOps & Server Automation Tools 统一服务启动器",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -69,10 +69,13 @@ def main():
     )
 
     # 捕获未知参数（便于透传给子脚本如 weekly_report_sync --once）
-    args, unknown = parser.parse_known_args()
+    args, unknown = parser.parse_known_args(argv)
 
     selected = SERVICES.get(args.service)
     if selected:
+        # 子服务会再次解析 sys.argv，只保留需要透传给它的参数。
+        # 例如: run.py weekly_report_sync --once -> 子脚本仅收到 --once。
+        sys.argv = [sys.argv[0], *unknown]
         selected["func"]()
     else:
         parser.print_help()

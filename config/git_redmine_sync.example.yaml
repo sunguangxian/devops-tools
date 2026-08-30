@@ -13,6 +13,8 @@ server:
   host: "0.0.0.0"
   port: 5000
   debug: false
+  threads: 4
+  health_timeout_seconds: 5
 
 # Redmine 服务器访问地址
 redmine_url: "http://redmine.example.com:3000"

@@ -1,6 +1,6 @@
 # DevOps Tools & Server Automation Platform (自动化运维与服务器工具集)
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey.svg)
 ![Architecture](https://img.shields.io/badge/Architecture-Modular%20%26%20Decoupled-orange.svg)
@@ -32,7 +32,7 @@
 - **完成邮件通知**：每封原邮件的附件全部归档成功后，通过 hMailServer 向本人发送附件及归档路径汇总。
 
 ### 3. 统一合并后台服务 (Unified Automation Server)
-- **极简运维部署**：启动单个主程序 `python run.py` 即可同时运行 Flask Web 服务与后台守护监听线程，无需维护多个进程。
+- **极简运维部署**：启动单个主程序 `python run.py` 即可同时运行 Waitress Web 服务与后台守护监听线程，无需维护多个进程。
 - **标准 HTTP 接口**：
   - `GET /`：服务主页与功能清单概览
   - `GET /health`：全局健康检查与各子功能配置就绪状态
@@ -102,7 +102,7 @@ devops-tools/
 # 进入项目目录
 cd devops-tools
 
-# 推荐创建并激活 Python 虚拟环境 (Python 3.8+)
+# 推荐使用受支持的 64 位 Python 创建并激活虚拟环境 (Python 3.9+)
 python -m venv venv
 source venv/bin/activate  # Linux / macOS
 # 或者 Windows: .\venv\Scripts\activate
@@ -140,7 +140,7 @@ python run.py git_redmine_sync        # 仅独立启动 Git-Redmine Webhook 服�
 python run.py weekly_report_sync      # 仅独立执行一次周报邮件检查与归档
 ```
 
-服务启动后，访问 `http://<服务器IP>:5000/health` 即可查看所有组件的运行健康状态。
+服务启动后，访问 `http://<服务器IP>:5000/health` 可检查后台轮询线程、最近一次执行结果，以及 IMAP、SeedDMS、Redmine 的实时连接状态。任一关键组件异常时返回 HTTP 503。
 
 ---
 
@@ -158,7 +158,7 @@ python run.py weekly_report_sync      # 仅独立执行一次周报邮件检查�
 
 ```powershell
 # 假设项目部署在 C:\devops-tools，虚拟环境 Python 解释器为 C:\devops-tools\venv\Scripts\python.exe
-# 1. 注册统一服务
+# 1. 注册统一服务（HTTP 由 Windows 兼容的 Waitress 承载）
 nssm install DevOpsAutomation "C:\devops-tools\venv\Scripts\python.exe" "C:\devops-tools\run.py"
 
 # 2. 设置工作目录

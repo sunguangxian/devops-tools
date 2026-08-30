@@ -7,6 +7,7 @@ DevOps 统一服务 (Unified Automation Server)
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 # 确保项目根目录在 sys.path 中
@@ -20,6 +21,7 @@ from common.config_loader import get_service_config
 from common.logger import setup_logger
 from services.git_redmine_sync.core import process_webhook
 from services.weekly_report_sync.core import sync_once, run_daemon
+from services.health import probe_dependencies
 
 logger = setup_logger(
     name="unified_server",
@@ -27,6 +29,28 @@ logger = setup_logger(
 )
 
 app = Flask(__name__)
+
+_worker_lock = threading.Lock()
+_worker_thread = None
+_worker_state = {
+    "last_started": None,
+    "last_completed": None,
+    "last_error": None,
+    "last_archived_count": None,
+}
+
+
+def _utc_now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def get_worker_health():
+    """返回周报后台线程的存活状态和最近一次运行结果。"""
+    with _worker_lock:
+        state = dict(_worker_state)
+        state["alive"] = bool(_worker_thread and _worker_thread.is_alive())
+    state["ok"] = state["alive"] and not state["last_error"]
+    return state
 
 
 # ------------------------------------------------------------------------------
@@ -56,15 +80,19 @@ def index():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """健康检查接口"""
+    """检查后台任务状态及 IMAP、SeedDMS、Redmine 的实际连通性。"""
     git_cfg = get_service_config("git_redmine_sync")
     report_cfg = get_service_config("weekly_report_sync")
+    timeout = float(git_cfg.get("server", {}).get("health_timeout_seconds", 5))
+    dependencies = probe_dependencies(git_cfg, report_cfg, timeout=timeout)
+    worker = get_worker_health()
+    healthy = worker["ok"] and all(item["ok"] for item in dependencies.values())
 
     return jsonify({
-        "status": "healthy",
-        "git_redmine_sync_configured": bool(git_cfg.get("redmine_url")),
-        "weekly_report_sync_configured": bool(report_cfg.get("mail_monitor", {}).get("username")),
-    }), 200
+        "status": "healthy" if healthy else "unhealthy",
+        "worker": worker,
+        "dependencies": dependencies,
+    }), 200 if healthy else 503
 
 
 @app.route("/webhook", methods=["POST"])
@@ -131,14 +159,28 @@ def start_weekly_report_background_worker():
         # 启动时稍作延迟，避开 Flask 初始化高峰
         time.sleep(3)
         while True:
+            with _worker_lock:
+                _worker_state["last_started"] = _utc_now()
             try:
-                sync_once(report_cfg)
+                archived = sync_once(report_cfg)
+                with _worker_lock:
+                    _worker_state["last_completed"] = _utc_now()
+                    _worker_state["last_error"] = None
+                    _worker_state["last_archived_count"] = archived
             except Exception as e:
+                with _worker_lock:
+                    _worker_state["last_completed"] = _utc_now()
+                    _worker_state["last_error"] = str(e)
                 logger.error(f"周报监听后台线程轮询异常: {e}", exc_info=True)
             time.sleep(interval)
 
-    t = threading.Thread(target=worker_loop, name="WeeklyReportWorker", daemon=True)
-    t.start()
+    global _worker_thread
+    _worker_thread = threading.Thread(
+        target=worker_loop,
+        name="WeeklyReportWorker",
+        daemon=True,
+    )
+    _worker_thread.start()
     logger.info("周报邮件监听后台线程启动成功")
 
 
@@ -152,7 +194,7 @@ def main():
     server_cfg = git_cfg.get("server", {})
     host = server_cfg.get("host", "0.0.0.0")
     port = int(server_cfg.get("port", 5000))
-    debug = bool(server_cfg.get("debug", False))
+    threads = int(server_cfg.get("threads", 4))
 
     logger.info("==================================================================")
     logger.info("正在启动 DevOps 统一自动化服务 (Unified Automation Server)")
@@ -161,10 +203,10 @@ def main():
     # 1. 启动周报后台监听线程
     start_weekly_report_background_worker()
 
-    # 2. 启动 Flask Webhook 服务
+    # 2. 使用 Windows 兼容的生产 WSGI 服务启动 HTTP 接口
     logger.info(f"HTTP 服务已就绪: http://{host}:{port} (支持 /webhook 与 /sync/weekly_report)")
-    # use_reloader=False 防止 debug 模式在多线程下重复拉起 background worker
-    app.run(host=host, port=port, debug=debug, use_reloader=False)
+    from waitress import serve
+    serve(app, host=host, port=port, threads=threads)
 
 
 if __name__ == "__main__":
