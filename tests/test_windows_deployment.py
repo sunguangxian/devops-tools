@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import run
 from services.health import probe_dependencies, probe_imap, probe_redmine, probe_seeddms
+from services.server import app
 
 
 class RunnerArgumentForwardingTests(unittest.TestCase):
@@ -74,6 +75,39 @@ class DependencyHealthTests(unittest.TestCase):
 
         self.assertEqual({"imap", "seeddms", "redmine"}, set(result))
         self.assertTrue(all(item["ok"] for item in result.values()))
+
+
+class ManualWeeklyReportTriggerTests(unittest.TestCase):
+    def setUp(self):
+        self.client = app.test_client()
+        self.config = {
+            "manual_trigger": {
+                "enabled": True,
+                "api_key": "test-secret-key",
+            }
+        }
+
+    def test_get_is_not_allowed(self):
+        response = self.client.get("/sync/weekly_report")
+        self.assertEqual(405, response.status_code)
+
+    def test_missing_api_key_is_rejected(self):
+        with patch("services.server.get_service_config", return_value=self.config):
+            response = self.client.post("/sync/weekly_report")
+        self.assertEqual(401, response.status_code)
+
+    def test_valid_api_key_triggers_sync(self):
+        with patch("services.server.get_service_config", return_value=self.config), patch(
+            "services.server.sync_once", return_value=2
+        ) as sync:
+            response = self.client.post(
+                "/sync/weekly_report",
+                headers={"X-API-Key": "test-secret-key"},
+            )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, response.get_json()["archived_count"])
+        sync.assert_called_once_with(self.config)
 
 
 if __name__ == "__main__":
