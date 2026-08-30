@@ -10,25 +10,24 @@ logger = logging.getLogger("weekly_report_sync.mail_notifier")
 
 
 def send_archive_notification(
-    mail_config: Dict[str, Any],
     notification_config: Dict[str, Any],
     source_subject: str,
     archived_items: List[Dict[str, str]],
 ) -> bool:
-    """通过 hMailServer 将本次归档结果发送给配置的收件人。"""
+    """通过 hMailServer SMTP 发送归档结果通知。"""
     if not notification_config.get("enabled", False) or not archived_items:
         return True
 
-    username = mail_config.get("username", "")
-    password = mail_config.get("password", "")
+    username = notification_config.get("username", "")
+    password = notification_config.get("password", "")
     recipient = notification_config.get("recipient") or username
-    smtp_host = notification_config.get("smtp_host") or mail_config.get("imap_host", "127.0.0.1")
+    smtp_host = notification_config.get("smtp_host", "127.0.0.1")
     smtp_port = int(notification_config.get("smtp_port", 25))
     use_ssl = bool(notification_config.get("use_ssl", False))
     use_starttls = bool(notification_config.get("starttls", False))
 
     if not username or not password or not recipient:
-        logger.error("归档通知配置不完整：缺少邮箱账号、密码或通知收件人")
+        logger.error("归档通知配置不完整：缺少 SMTP 账号、密码或通知收件人")
         return False
 
     message = EmailMessage()
