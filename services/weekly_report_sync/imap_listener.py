@@ -10,8 +10,12 @@ import email
 import imaplib
 import logging
 from email.header import decode_header
+from email.message import Message
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+
+from services.weekly_report_sync.filename_rules import parse_attachment_destination
 
 logger = logging.getLogger("weekly_report_sync.imap_listener")
 
@@ -42,6 +46,22 @@ def extract_email_address(from_header: str) -> str:
     """
     match = re.search(r"[\w\.-]+@[\w\.-]+", from_header)
     return match.group(0).lower() if match else from_header.lower()
+
+
+def extract_recipient_addresses(message: Message) -> set:
+    """提取 To 和 CC 中的全部收件人地址。"""
+    header_values = message.get_all("To", []) + message.get_all("Cc", [])
+    return {
+        address.strip().lower()
+        for _, address in getaddresses(header_values)
+        if address.strip()
+    }
+
+
+def has_required_recipients(message: Message, required_recipients: set) -> bool:
+    """判断 To/CC 是否包含全部最终分发收件人。"""
+    normalized_required = {address.strip().lower() for address in required_recipients}
+    return normalized_required.issubset(extract_recipient_addresses(message))
 
 
 class IMAPMailListener:
@@ -109,6 +129,10 @@ class IMAPMailListener:
 
             keywords = [kw.lower() for kw in filter_rules.get("subject_keywords", ["周报"])]
             allowed_senders = [s.lower() for s in filter_rules.get("allowed_senders", [])]
+            required_recipients = {
+                address.lower()
+                for address in filter_rules.get("required_recipients", [])
+            }
             allowed_extensions = [ext.lower() for ext in filter_rules.get("allowed_extensions", [])]
 
             temp_dir.mkdir(parents=True, exist_ok=True)
@@ -130,10 +154,9 @@ class IMAPMailListener:
                 if unique_key in processed_message_ids:
                     continue
 
-                # 1. 检查主题关键词过滤
+                # 1. 检查主题关键词；附件名符合归档规则时也允许通过
                 subject_lower = subject.lower()
-                if keywords and not any(kw in subject_lower for kw in keywords):
-                    continue
+                subject_matches = not keywords or any(kw in subject_lower for kw in keywords)
 
                 # 2. 检查发件人过滤
                 from_raw = decode_str(msg.get("From", ""))
@@ -142,10 +165,22 @@ class IMAPMailListener:
                     logger.info(f"发件人 [{sender_email}] 不在白名单列表中，跳过")
                     continue
 
+                # 3. 最终分发邮件的 To/CC 必须包含全部指定收件组。
+                recipient_addresses = extract_recipient_addresses(msg)
+                missing_recipients = required_recipients - recipient_addresses
+                if not has_required_recipients(msg, required_recipients):
+                    logger.info(
+                        "邮件 [%s] 尚未发送给全部研发组，缺少: %s，跳过",
+                        subject,
+                        ", ".join(sorted(missing_recipients)),
+                    )
+                    continue
+
                 logger.info(f"匹配到周报邮件: [{subject}], 发件人: [{from_raw}], Message-ID: [{unique_key}]")
 
-                # 3. 提取附件
+                # 4. 提取附件
                 attachments = []
+                attachment_name_matches = False
                 for part in msg.walk():
                     if part.get_content_maintype() == "multipart":
                         continue
@@ -163,6 +198,8 @@ class IMAPMailListener:
                     if allowed_extensions and ext not in allowed_extensions:
                         logger.info(f"附件 [{filename}] 格式不在白名单内，跳过")
                         continue
+                    if parse_attachment_destination(filename):
+                        attachment_name_matches = True
 
                     # 保存附件到本地临时目录
                     safe_filename = re.sub(r'[\\/*?:"<>|]', "_", filename)
@@ -175,13 +212,23 @@ class IMAPMailListener:
                             attachments.append(filepath)
                             logger.info(f"成功提取周报附件: {filename} ({len(payload)} bytes)")
                     except Exception as e:
-                        logger.error(f"提取保存附件出错 [{filename}]: {e}", exc_info=True)
+                            logger.error(f"提取保存附件出错 [{filename}]: {e}", exc_info=True)
+
+                if not subject_matches and not attachment_name_matches:
+                    logger.info(f"邮件 [{subject}] 的主题和附件名均不符合周会归档规则，跳过")
+                    for filepath in attachments:
+                        try:
+                            filepath.unlink()
+                        except Exception:
+                            pass
+                    continue
 
                 results.append({
                     "unique_key": unique_key,
                     "subject": subject,
                     "from": from_raw,
                     "sender_email": sender_email,
+                    "recipients": sorted(recipient_addresses),
                     "date": date_str,
                     "attachments": attachments,
                 })

@@ -31,14 +31,18 @@ mail_monitor:
 # 2. 周报邮件匹配与附件提取规则
 # ------------------------------------------------------------------------------
 filter_rules:
-  # 主题关键词匹配（仅当邮件主题包含以下关键词之一时才进行归档备份）
+  # 主题包含关键词，或附件名可解析出年份和类别时进行归档
   subject_keywords:
-    - "周报"
-    - "工作周报"
-    - "weekly report"
+    - "周会"
+    - "会议纪要"
 
   # 限制发件人邮箱（可选，为空表示不限制发件人）
   allowed_senders: []
+
+  # 最终分发邮件的 To/CC 必须同时包含以下全部地址；为空表示不限制收件人
+  required_recipients:
+    - "software_group@company.com"
+    - "hardware_group@company.com"
 
   # 支持归档的附件后缀名白名单
   allowed_extensions:
@@ -65,14 +69,26 @@ seeddms:
   # 是否在目标目录下按年份自动分类（自动查找或创建如 '2026年' 子目录并归档）
   auto_create_year_folder: true
 
-  # 文档在 SeedDMS 中显示的标题命名规则（支持 {subject}、{sender}、{year}、{week}、{date}、{filename}）
-  document_name_template: "【{year}年第{week}周】{subject}"
+  # 文档在 SeedDMS 中显示的标题；保留原附件名才能对同名文档自动新增版本
+  document_name_template: "{filename}"
 
   # 文档描述/备注
   comment: "由邮件发送监控系统自动捕获并归档"
 
 # ------------------------------------------------------------------------------
-# 4. 本地临时缓存与已处理记录配置
+# 4. 归档完成邮件通知
+# ------------------------------------------------------------------------------
+notification:
+  enabled: true
+  smtp_host: "127.0.0.1"             # hMailServer SMTP 地址
+  smtp_port: 25
+  use_ssl: false
+  starttls: false
+  recipient: "report_sender@company.com"
+  subject: "周会纪要自动归档完成"
+
+# ------------------------------------------------------------------------------
+# 5. 本地临时缓存与已处理记录配置
 # ------------------------------------------------------------------------------
 storage:
   temp_dir: "./data/temp_attachments"          # 附件临时保存提取目录

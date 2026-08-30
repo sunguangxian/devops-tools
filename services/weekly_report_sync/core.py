@@ -6,15 +6,22 @@
 import json
 import time
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Set, Any
 
 from common.config_loader import get_project_root
+from services.weekly_report_sync.filename_rules import parse_attachment_destination
+from services.weekly_report_sync.mail_notifier import send_archive_notification
 from services.weekly_report_sync.seeddms_client import SeedDMSClient
 from services.weekly_report_sync.imap_listener import IMAPMailListener
 
 logger = logging.getLogger("weekly_report_sync.core")
+
+# 统一服务允许后台轮询和 HTTP 手动触发同时调用 sync_once。
+# 使用进程内互斥锁，避免重复读取/覆盖处理历史和临时附件。
+_sync_lock = threading.Lock()
 
 
 def load_processed_history(history_file_path: Path) -> Set[str]:
@@ -73,6 +80,12 @@ def sync_once(config: Dict[str, Any]) -> int:
     执行单次邮件扫描并同步至 SeedDMS
     :return: 成功备份归档的文件数
     """
+    with _sync_lock:
+        return _sync_once(config)
+
+
+def _sync_once(config: Dict[str, Any]) -> int:
+    """在调用方持有同步锁时执行一次邮件扫描与归档。"""
     storage_cfg = config.get("storage", {})
     temp_dir = get_project_root() / storage_cfg.get("temp_dir", "./data/temp_attachments")
     history_file = get_project_root() / storage_cfg.get("history_file", "./data/processed_emails.json")
@@ -97,10 +110,12 @@ def sync_once(config: Dict[str, Any]) -> int:
     seeddms_cfg = config.get("seeddms", {})
     dms_client = SeedDMSClient(seeddms_cfg)
 
-    doc_name_tmpl = seeddms_cfg.get("document_name_template", "【周报】{subject} - {sender}")
+    doc_name_tmpl = seeddms_cfg.get("document_name_template", "{filename}")
     comment_tmpl = seeddms_cfg.get("comment", "由邮件监控自动备份")
 
     archived_count = 0
+    notification_cfg = config.get("notification", {})
+    mail_cfg = config.get("mail_monitor", {})
 
     for item in new_emails:
         unique_key = item["unique_key"]
@@ -114,9 +129,21 @@ def sync_once(config: Dict[str, Any]) -> int:
             continue
 
         email_all_archived = True
+        archived_items = []
         for att_path in attachments:
+            destination = parse_attachment_destination(att_path.name)
+            if not destination:
+                email_all_archived = False
+                logger.error(
+                    f"附件名无法解析年份和类别，保留邮件等待处理: [{att_path.name}]"
+                )
+                continue
+
+            attachment_year, category = destination
             ctx = get_date_context()
             ctx.update({
+                "year": attachment_year,
+                "category": category,
                 "subject": subject,
                 "sender": sender,
                 "filename": att_path.name,
@@ -131,11 +158,17 @@ def sync_once(config: Dict[str, Any]) -> int:
                 file_path=att_path,
                 doc_name=doc_name,
                 comment=comment,
-                year=ctx.get("year"),
+                year=attachment_year,
+                category=category,
             )
 
             if success:
                 archived_count += 1
+                archived_items.append({
+                    "filename": att_path.name,
+                    "year": attachment_year,
+                    "category": category,
+                })
                 # 上传成功后清理本地临时文件
                 try:
                     att_path.unlink()
@@ -147,6 +180,12 @@ def sync_once(config: Dict[str, Any]) -> int:
 
         if email_all_archived:
             processed_ids.add(unique_key)
+            send_archive_notification(
+                mail_config=mail_cfg,
+                notification_config=notification_cfg,
+                source_subject=subject,
+                archived_items=archived_items,
+            )
 
     # 保存处理状态
     save_processed_history(history_file, processed_ids)
