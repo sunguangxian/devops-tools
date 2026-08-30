@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import run
-from services.health import probe_dependencies, probe_imap, probe_redmine, probe_seeddms
+from services.health import probe_dependencies, probe_event_queue, probe_redmine, probe_seeddms
 from services.server import app
 
 
@@ -23,18 +25,13 @@ class RunnerArgumentForwardingTests(unittest.TestCase):
 
 
 class DependencyHealthTests(unittest.TestCase):
-    def test_imap_reports_success_after_login(self):
-        mail = unittest.mock.MagicMock()
-        with patch("services.health._create_imap_client", return_value=mail):
-            result = probe_imap({
-                "imap_host": "mail.example.com",
-                "imap_port": 143,
-                "username": "user@example.com",
-                "password": "secret",
-            }, timeout=2)
-
+    def test_event_queue_reports_writable_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = probe_event_queue({
+                "enabled": True,
+                "queue_dir": str(Path(temp_dir) / "queue"),
+            })
         self.assertTrue(result["ok"])
-        mail.login.assert_called_once_with("user@example.com", "secret")
 
     def test_seeddms_rejects_redirect_back_to_login(self):
         session = unittest.mock.MagicMock()
@@ -68,13 +65,46 @@ class DependencyHealthTests(unittest.TestCase):
         self.assertIn("401", result["message"])
 
     def test_dependency_checks_run_all_probes(self):
-        with patch("services.health.probe_imap", return_value={"ok": True}), patch(
+        with patch("services.health.probe_event_queue", return_value={"ok": True}), patch(
             "services.health.probe_seeddms", return_value={"ok": True}
         ), patch("services.health.probe_redmine", return_value={"ok": True}):
             result = probe_dependencies({}, {}, timeout=2)
 
-        self.assertEqual({"imap", "seeddms", "redmine"}, set(result))
+        self.assertEqual({"hmail_event_queue", "seeddms", "redmine"}, set(result))
         self.assertTrue(all(item["ok"] for item in result.values()))
+
+
+class HMailServerEventEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self.client = app.test_client()
+        self.config = {
+            "hmail_event": {
+                "enabled": True,
+                "api_key": "event-secret-key",
+                "allow_remote": False,
+            }
+        }
+
+    def test_get_is_not_allowed(self):
+        response = self.client.get("/event/hmailserver")
+        self.assertEqual(405, response.status_code)
+
+    def test_missing_event_api_key_is_rejected(self):
+        with patch("services.server.get_service_config", return_value=self.config):
+            response = self.client.post("/event/hmailserver")
+        self.assertEqual(401, response.status_code)
+
+    def test_valid_event_api_key_wakes_queue_worker(self):
+        with patch("services.server.get_service_config", return_value=self.config), patch(
+            "services.server._queue_wakeup.set"
+        ) as wakeup:
+            response = self.client.post(
+                "/event/hmailserver",
+                headers={"X-API-Key": "event-secret-key"},
+            )
+
+        self.assertEqual(202, response.status_code)
+        wakeup.assert_called_once_with()
 
 
 class ManualWeeklyReportTriggerTests(unittest.TestCase):
@@ -84,7 +114,8 @@ class ManualWeeklyReportTriggerTests(unittest.TestCase):
             "manual_trigger": {
                 "enabled": True,
                 "api_key": "test-secret-key",
-            }
+            },
+            "hmail_event": {"queue_dir": "./data/mail_event_queue"},
         }
 
     def test_get_is_not_allowed(self):
@@ -96,10 +127,10 @@ class ManualWeeklyReportTriggerTests(unittest.TestCase):
             response = self.client.post("/sync/weekly_report")
         self.assertEqual(401, response.status_code)
 
-    def test_valid_api_key_triggers_sync(self):
+    def test_valid_api_key_triggers_queue_processing(self):
         with patch("services.server.get_service_config", return_value=self.config), patch(
             "services.server.sync_once", return_value=2
-        ) as sync:
+        ) as sync, patch("services.server.get_pending_queue_count", return_value=0):
             response = self.client.post(
                 "/sync/weekly_report",
                 headers={"X-API-Key": "test-secret-key"},
