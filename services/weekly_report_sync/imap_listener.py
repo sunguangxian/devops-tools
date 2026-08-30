@@ -132,6 +132,7 @@ class IMAPMailListener:
         self.password = config.get("password", "")
         self.folder = config.get("folder", "Sent")
         self.timeout = float(config.get("timeout_seconds", 10))
+        self.initial_scan_limit = max(int(config.get("initial_scan_limit", 30)), 0)
 
     def connect(self) -> Optional[imaplib.IMAP4]:
         """连接并登录 IMAP 服务器。"""
@@ -187,19 +188,20 @@ class IMAPMailListener:
             results.uid_validity = uid_validity
 
             start_uid = max(int(last_uid or 0) + 1, 1)
+            bootstrap_scan = int(last_uid or 0) <= 0 and expected_uid_validity is None
             if (
                 expected_uid_validity is not None
                 and uid_validity is not None
                 and int(expected_uid_validity) != int(uid_validity)
             ):
                 logger.warning(
-                    "检测到 IMAP UIDVALIDITY 变化 (%s -> %s)，将从 UID 1 重新扫描；"
-                    "已处理 Message-ID 仍会用于防重",
+                    "检测到 IMAP UIDVALIDITY 变化 (%s -> %s)，重新建立 UID 游标",
                     expected_uid_validity,
                     uid_validity,
                 )
                 start_uid = 1
                 results.uid_reset = True
+                bootstrap_scan = True
 
             status, data = mail.uid("search", None, "UID", f"{start_uid}:*")
             if status != "OK":
@@ -207,16 +209,29 @@ class IMAPMailListener:
                 results.scan_ok = False
                 return results
 
-            uid_values = data[0].split() if data and data[0] else []
             uid_numbers = []
-            for raw_uid in uid_values:
+            for raw_uid in (data[0].split() if data and data[0] else []):
                 try:
                     uid_numbers.append(int(raw_uid))
                 except (TypeError, ValueError):
                     logger.warning(f"忽略无法解析的 IMAP UID: {raw_uid!r}")
 
+            uid_numbers.sort()
             if uid_numbers:
-                results.max_uid = max(uid_numbers)
+                results.max_uid = uid_numbers[-1]
+
+            # 第一次建立状态或 UIDVALIDITY 重置时，仅回看最近 N 封，避免把多年历史邮件重新归档。
+            if (
+                bootstrap_scan
+                and self.initial_scan_limit > 0
+                and len(uid_numbers) > self.initial_scan_limit
+            ):
+                logger.info(
+                    "首次建立 IMAP UID 游标，仅回看最近 %s 封邮件（总邮件数: %s）",
+                    self.initial_scan_limit,
+                    len(uid_numbers),
+                )
+                uid_numbers = uid_numbers[-self.initial_scan_limit:]
 
             keywords = [
                 kw.lower()
@@ -238,7 +253,7 @@ class IMAPMailListener:
             temp_dir.mkdir(parents=True, exist_ok=True)
 
             # 必须按 UID 从小到大处理，便于失败时安全回退游标。
-            for uid in sorted(uid_numbers):
+            for uid in uid_numbers:
                 try:
                     status, msg_data = mail.uid("fetch", str(uid), "(RFC822)")
                     if status != "OK" or not msg_data:
