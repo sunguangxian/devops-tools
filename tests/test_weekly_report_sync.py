@@ -310,7 +310,7 @@ class WeeklyReportSyncRoutingTests(unittest.TestCase):
             second = root / "硬件周会(2026-08-30).docx"
             history_file = root / "history.json"
 
-            def make_result():
+            def make_result(*args, **kwargs):
                 first.write_bytes(b"first-content")
                 second.write_bytes(b"second-content")
                 return MailFetchResult([{
@@ -323,7 +323,7 @@ class WeeklyReportSyncRoutingTests(unittest.TestCase):
 
             with patch(
                 "services.weekly_report_sync.core.IMAPMailListener.fetch_unprocessed_emails",
-                side_effect=[make_result(), make_result()],
+                side_effect=make_result,
             ), patch("services.weekly_report_sync.core.SeedDMSClient") as client_class:
                 client = client_class.return_value
                 client.upload_document.side_effect = [True, False, True]
