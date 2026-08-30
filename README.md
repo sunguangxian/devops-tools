@@ -28,18 +28,18 @@
 
 ## 2. hMailServer Event -> SeedDMS
 
-邮件归档已改为 **hMailServer Event 驱动**，不再通过 IMAP 扫描 Sent 文件夹。
+邮件归档使用 **hMailServer Event 驱动**，不再通过 IMAP 扫描 Sent 文件夹。
 
 流程：
 
 ```text
-邮件经 hMailServer 投递
+邮件客户端通过 SMTP AUTH 提交邮件
         │
         ▼
-OnDeliverMessage
+OnAcceptMessage(oClient, oMessage)
         │
-        ├── 复制 oMessage.Filename
-        │      到 data/mail_event_queue/*.eml
+        ├── 先复制为 data/mail_event_queue/*.tmp
+        │   再发布为 *.eml
         │
         └── POST /event/hmailserver
                  │
@@ -59,12 +59,19 @@ OnDeliverMessage
         processed_emails.json
 ```
 
+### 为什么使用 OnAcceptMessage
+
+`OnAcceptMessage(oClient, oMessage)` 在 SMTP DATA 接收完成后触发，并能读取 `oClient.Authenticated`。示例脚本默认只捕获已经 SMTP AUTH 的用户提交邮件，因此外部邮件服务器投递到本机的普通来信不会进入归档队列。
+
+与投递阶段的 `OnDeliverMessage` 相比，它更符合“用户发送邮件后归档”的语义，并避免外部投递重试导致同一邮件事件重复触发。
+
 ### 主要特性
 
 - 不依赖邮件客户端是否保存 Sent 副本；
-- 不需要 IMAP 账号，也不存在轮询漏邮件问题；
+- 不需要 IMAP 账号，也不存在 IMAP 轮询漏邮件问题；
 - hMailServer Event 只负责复制 `.eml` 和本机 HTTP 通知，不等待 SeedDMS 上传；
-- devops-tools 服务暂时停止时，`.eml` 会继续保留在本地队列，服务恢复后自动处理；
+- `.tmp -> .eml` 发布方式避免 Python 读取复制到一半的邮件；
+- devops-tools 服务暂时停止时，`.eml` 会保留在本地队列，服务恢复后自动处理；
 - Message-ID 防重复；无 Message-ID 时使用整封邮件 SHA256；
 - 每封邮件使用独立附件临时目录，避免同名文件覆盖；
 - 附件按 `文件名 + SHA256` 记录状态，部分上传失败后只重试失败附件；
@@ -179,7 +186,7 @@ storage:
   history_file: "./data/processed_emails.json"
 ```
 
-`allowed_senders` 建议明确填写。`OnDeliverMessage` 会看到 hMailServer 的全部待投递邮件，发件人白名单可以避免外部来信被误识别为归档邮件。
+即使 VBS 已默认过滤未认证 SMTP 会话，`allowed_senders` 仍建议明确填写，形成第二层保护。
 
 ---
 
@@ -191,21 +198,22 @@ storage:
 scripts\hmailserver\EventHandlers.example.vbs
 ```
 
-先修改其中三个常量：
+先修改：
 
 ```vbscript
 Const DEVOPS_QUEUE_DIR = "C:\server-service\devops-tools\data\mail_event_queue"
 Const DEVOPS_EVENT_URL = "http://127.0.0.1:5000/event/hmailserver"
 Const DEVOPS_EVENT_KEY = "与 weekly_report_sync.yaml 一致"
+Const DEVOPS_REQUIRE_AUTHENTICATED = True
 ```
 
-然后把其中的代码合并到 hMailServer 的：
+然后把代码合并到 hMailServer 的：
 
 ```text
 C:\Program Files (x86)\hMailServer\Events\EventHandlers.vbs
 ```
 
-如果你的 hMailServer 安装在 64 位 Program Files，则按实际安装目录修改。
+如果你的安装目录不同，按实际路径修改。
 
 在 hMailServer Administrator 中：
 
@@ -215,24 +223,33 @@ C:\Program Files (x86)\hMailServer\Events\EventHandlers.vbs
 4. 点击 `Check syntax`；
 5. 点击 `Reload scripts`。
 
-事件使用：
+核心事件：
 
 ```vbscript
-Sub OnDeliverMessage(oMessage)
+Sub OnAcceptMessage(oClient, oMessage)
 ```
+
+默认：
+
+```vbscript
+If Not oClient.Authenticated Then Exit Sub
+```
+
+因此主要捕获用户通过 SMTP AUTH 主动提交的邮件。
 
 事件内不会直接访问 SeedDMS，只会：
 
 ```text
-CopyFile oMessage.Filename -> mail_event_queue
+Copy oMessage.Filename -> mail_event_queue/*.tmp
+Move *.tmp -> *.eml
 POST http://127.0.0.1:5000/event/hmailserver
 ```
 
-因此 SeedDMS 慢或暂时不可用时，不会让 hMailServer 长时间等待上传。
+SeedDMS 慢或暂时不可用时，不会让 hMailServer 等待附件上传。
 
 ### Windows 权限
 
-hMailServer 服务运行账号必须至少能够写入：
+hMailServer 服务运行账号必须能够写入：
 
 ```text
 C:\server-service\devops-tools\data\mail_event_queue
@@ -295,7 +312,7 @@ nssm set DevOpsAutomation AppRestartDelay 5000
 nssm start DevOpsAutomation
 ```
 
-服务恢复后会首先扫描 `mail_event_queue` 中遗留的 `.eml`，所以 hMailServer 事件发生时即使 devops-tools 正在重启，也不会丢失已经成功复制到队列的邮件。
+服务恢复后会首先扫描 `mail_event_queue` 中遗留的 `.eml`，所以 hMailServer 事件发生时即使 devops-tools 正在重启，也不会丢失已经发布到队列的邮件。
 
 ---
 
