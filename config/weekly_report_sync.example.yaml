@@ -1,0 +1,79 @@
+# ==============================================================================
+# 周报自动归档至 SeedDMS 配置模板 (weekly_report_sync)
+#
+# 使用说明：
+# 1. 复制此文件为 weekly_report_sync.yaml:
+#    cp config/weekly_report_sync.example.yaml config/weekly_report_sync.yaml
+# 2. 填写实际的邮箱凭证、邮件过滤规则和 SeedDMS 登录信息
+# 3. 注意：weekly_report_sync.yaml 会被 .gitignore 忽略，保护密码安全！
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. hMailServer 邮件监听配置 (IMAP 轮询监控)
+# ------------------------------------------------------------------------------
+mail_monitor:
+  # hMailServer IMAP 服务配置 (同机通常为 127.0.0.1)
+  imap_host: "127.0.0.1"
+  imap_port: 143                   # 常用端口: 143 (明文/STARTTLS) 或 993 (SSL)
+  use_ssl: false
+
+  # 监控的邮箱账号与密码（推荐监控发件人自己的发件箱 Sent，或者专用归档邮箱）
+  username: "report_sender@company.com"
+  password: "your_email_password"
+
+  # 要监控的邮件文件夹名称（常见: "Sent", "Sent Messages", "已发送邮件", "INBOX"）
+  folder: "Sent"
+
+  # 自动轮询间隔（秒）- 作为后台服务运行时的检查频率
+  poll_interval_seconds: 60
+
+# ------------------------------------------------------------------------------
+# 2. 周报邮件匹配与附件提取规则
+# ------------------------------------------------------------------------------
+filter_rules:
+  # 主题关键词匹配（仅当邮件主题包含以下关键词之一时才进行归档备份）
+  subject_keywords:
+    - "周报"
+    - "工作周报"
+    - "weekly report"
+
+  # 限制发件人邮箱（可选，为空表示不限制发件人）
+  allowed_senders: []
+
+  # 支持归档的附件后缀名白名单
+  allowed_extensions:
+    - ".docx"
+    - ".doc"
+    - ".xlsx"
+    - ".xls"
+    - ".pptx"
+    - ".pdf"
+    - ".zip"
+
+# ------------------------------------------------------------------------------
+# 3. SeedDMS 知识库归档配置
+# ------------------------------------------------------------------------------
+seeddms:
+  enabled: true                                # 是否开启 SeedDMS 归档
+  api_url: "http://seeddms.example.com:8080"   # SeedDMS Web 访问基础地址
+  username: "your_username"                    # SeedDMS 账号
+  password: "your_password"                    # SeedDMS 密码
+
+  # 目标归档父文件夹 ID（如周会目录: folderid=24）
+  target_folder_id: 24
+
+  # 是否在目标目录下按年份自动分类（自动查找或创建如 '2026年' 子目录并归档）
+  auto_create_year_folder: true
+
+  # 文档在 SeedDMS 中显示的标题命名规则（支持 {subject}、{sender}、{year}、{week}、{date}、{filename}）
+  document_name_template: "【{year}年第{week}周】{subject}"
+
+  # 文档描述/备注
+  comment: "由邮件发送监控系统自动捕获并归档"
+
+# ------------------------------------------------------------------------------
+# 4. 本地临时缓存与已处理记录配置
+# ------------------------------------------------------------------------------
+storage:
+  temp_dir: "./data/temp_attachments"          # 附件临时保存提取目录
+  history_file: "./data/processed_emails.json" # 已处理邮件 Message-ID 记录文件（防止重复归档）

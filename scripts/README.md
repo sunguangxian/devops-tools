@@ -7,7 +7,7 @@
 为了保证每个脚本职责明确、互相独立，**每个脚本都拥有自己独立的配置与日志**：
 
 ```text
-flask/
+devops-tools/
 ├── config/
 │   ├── git_redmine_sync.example.yaml     # git_redmine_sync 的配置模板
 │   ├── git_redmine_sync.yaml             # git_redmine_sync 的实际生产配置（.gitignore 忽略）
@@ -74,5 +74,5 @@ if __name__ == "__main__":
 ### 3. 配置 Linux Crontab 定时运行
 ```bash
 # 每天凌晨 2 点执行备份脚本
-0 2 * * * /opt/tools/flask/venv/bin/python /opt/tools/flask/scripts/db_backup.py >> /dev/null 2>&1
+0 2 * * * /opt/devops-tools/venv/bin/python /opt/devops-tools/scripts/db_backup.py >> /dev/null 2>&1
 ```
