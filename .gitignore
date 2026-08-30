@@ -60,8 +60,7 @@ ENV/
 env.bak/
 venv.bak/
 
-# Sensitive Configurations (Local configs containing passwords, API keys, URLs)
-# 忽略所有生产实际配置文件，仅保留 *.example.* 示例模板
+# Sensitive Configurations
 config/*.yaml
 config/*.yml
 config/*.json
@@ -72,6 +71,10 @@ config/*.conf
 !config/*.example.json
 !config/*.example.ini
 !config/*.example.conf
+
+# Runtime data
+# 包含完整 .eml、临时附件和处理状态，禁止提交到 Git。
+data/
 
 # Legacy configs
 config.py
