@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 
-import threading
 import tempfile
+import threading
 import time
 import unittest
 from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
 
-from services.weekly_report_sync.core import sync_once
+from services.weekly_report_sync.core import load_sync_state, sync_once
 from services.weekly_report_sync.imap_listener import (
+    IMAPMailListener,
+    MailFetchResult,
     extract_recipient_addresses,
     has_required_recipients,
 )
@@ -85,6 +87,116 @@ class MailRecipientRuleTests(unittest.TestCase):
         required = {"SW_GROUP@HKLF.COM", "hw_group@hklf.com"}
 
         self.assertTrue(has_required_recipients(message, required))
+
+
+class FakeIMAP:
+    def __init__(self, messages):
+        self.messages = messages
+        self.sock = unittest.mock.MagicMock()
+        self.fetched_uids = []
+
+    def select(self, *args, **kwargs):
+        return "OK", [str(len(self.messages)).encode()]
+
+    def response(self, name):
+        if name == "UIDVALIDITY":
+            return "UIDVALIDITY", [b"12345"]
+        return None, None
+
+    def uid(self, command, *args):
+        if command == "search":
+            return "OK", [b" ".join(str(uid).encode() for uid in sorted(self.messages))]
+        if command == "fetch":
+            uid = int(args[0])
+            self.fetched_uids.append(uid)
+            return "OK", [(b"RFC822", self.messages[uid])]
+        raise AssertionError(f"unexpected UID command: {command}")
+
+    def logout(self):
+        return "BYE", [b""]
+
+
+class IMAPIncrementalScanTests(unittest.TestCase):
+    @staticmethod
+    def _build_message(message_id, payload, subject="项目周会"):
+        message = EmailMessage()
+        message["Message-ID"] = message_id
+        message["From"] = "sender@example.com"
+        message["To"] = "group@example.com"
+        message["Subject"] = subject
+        message.set_content("test")
+        message.add_attachment(
+            payload,
+            maintype="application",
+            subtype="octet-stream",
+            filename="项目周会(2026-08-30).docx",
+        )
+        return message.as_bytes()
+
+    def test_same_attachment_name_from_different_emails_uses_separate_directories(self):
+        fake = FakeIMAP({
+            10: self._build_message("<message-10@example.com>", b"first"),
+            11: self._build_message("<message-11@example.com>", b"second"),
+        })
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            listener = IMAPMailListener({
+                "username": "u",
+                "password": "p",
+                "initial_scan_limit": 30,
+            })
+            with patch.object(listener, "connect", return_value=fake):
+                result = listener.fetch_unprocessed_emails(
+                    processed_message_ids=set(),
+                    filter_rules={"subject_keywords": ["周会"]},
+                    temp_dir=Path(temp_dir),
+                )
+
+            self.assertEqual(2, len(result))
+            self.assertNotEqual(
+                result[0]["attachments"][0].parent,
+                result[1]["attachments"][0].parent,
+            )
+            self.assertEqual(b"first", result[0]["attachments"][0].read_bytes())
+            self.assertEqual(b"second", result[1]["attachments"][0].read_bytes())
+
+    def test_initial_scan_limit_only_applies_when_state_is_missing(self):
+        messages = {
+            uid: self._build_message(f"<message-{uid}@example.com>", str(uid).encode())
+            for uid in range(1, 41)
+        }
+        fake = FakeIMAP(messages)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            listener = IMAPMailListener({
+                "username": "u",
+                "password": "p",
+                "initial_scan_limit": 2,
+            })
+            with patch.object(listener, "connect", return_value=fake):
+                result = listener.fetch_unprocessed_emails(
+                    processed_message_ids=set(),
+                    filter_rules={"subject_keywords": ["周会"]},
+                    temp_dir=Path(temp_dir),
+                    last_uid=0,
+                    expected_uid_validity=None,
+                )
+
+        self.assertEqual([39, 40], fake.fetched_uids)
+        self.assertEqual(40, result.max_uid)
+
+
+class SyncStateTests(unittest.TestCase):
+    def test_legacy_list_state_is_not_migrated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "processed_emails.json"
+            state_path.write_text('["old-message-id"]', encoding="utf-8")
+
+            state = load_sync_state(state_path)
+
+        self.assertEqual(0, state["last_uid"])
+        self.assertEqual({}, state["processed_messages"])
+        self.assertEqual(2, state["version"])
 
 
 class WeeklyReportSyncRoutingTests(unittest.TestCase):
@@ -168,6 +280,7 @@ class WeeklyReportSyncRoutingTests(unittest.TestCase):
                 "services.weekly_report_sync.core.send_archive_notification"
             ) as notify:
                 client_class.return_value.upload_document.return_value = True
+                notify.return_value = True
                 sync_once({
                     "mail_monitor": {"username": "user@example.com"},
                     "filter_rules": {},
@@ -189,6 +302,60 @@ class WeeklyReportSyncRoutingTests(unittest.TestCase):
                     "category": "研发项目周会会议纪要",
                 }],
             )
+
+    def test_partial_failure_does_not_reupload_successful_attachment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "软件周会(2026-08-30).docx"
+            second = root / "硬件周会(2026-08-30).docx"
+            history_file = root / "history.json"
+
+            def make_result():
+                first.write_bytes(b"first-content")
+                second.write_bytes(b"second-content")
+                return MailFetchResult([{
+                    "uid": 100,
+                    "unique_key": "message-retry",
+                    "subject": "研发周会",
+                    "sender_email": "user@example.com",
+                    "attachments": [first, second],
+                }], max_uid=100, uid_validity=12345)
+
+            with patch(
+                "services.weekly_report_sync.core.IMAPMailListener.fetch_unprocessed_emails",
+                side_effect=[make_result(), make_result()],
+            ), patch("services.weekly_report_sync.core.SeedDMSClient") as client_class:
+                client = client_class.return_value
+                client.upload_document.side_effect = [True, False, True]
+                config = {
+                    "mail_monitor": {},
+                    "filter_rules": {},
+                    "storage": {
+                        "temp_dir": temp_dir,
+                        "history_file": str(history_file),
+                    },
+                    "seeddms": {"document_name_template": "{filename}"},
+                }
+
+                first_count = sync_once(config)
+                second_count = sync_once(config)
+
+            self.assertEqual(1, first_count)
+            self.assertEqual(1, second_count)
+            self.assertEqual(3, client.upload_document.call_count)
+            uploaded_names = [
+                call.kwargs["file_path"].name
+                for call in client.upload_document.call_args_list
+            ]
+            self.assertEqual([
+                "软件周会(2026-08-30).docx",
+                "硬件周会(2026-08-30).docx",
+                "硬件周会(2026-08-30).docx",
+            ], uploaded_names)
+            state = load_sync_state(history_file)
+            self.assertIn("message-retry", state["processed_messages"])
+            self.assertNotIn("message-retry", state["attachments"])
+            self.assertEqual(100, state["last_uid"])
 
 
 class ArchiveNotificationTests(unittest.TestCase):
