@@ -1,29 +1,50 @@
 # -*- coding: utf-8 -*-
 """
-hMailServer IMAP 邮件监听与附件解析模块
-负责连接 IMAP 服务器，检索符合周报规则的新发送/接收邮件，并自动提取附件。
+hMailServer IMAP 邮件监听与附件解析模块。
+负责连接 IMAP 服务器，使用 UID 增量检索新发送/接收邮件，并自动提取附件。
 """
 
-import os
-import re
 import email
+import hashlib
 import imaplib
 import logging
+import re
+import shutil
+import socket
 from email.header import decode_header
 from email.message import Message
 from email.utils import getaddresses
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional
 
 from services.weekly_report_sync.filename_rules import parse_attachment_destination
 
 logger = logging.getLogger("weekly_report_sync.imap_listener")
 
 
+class MailFetchResult(list):
+    """兼容 list 的 IMAP 扫描结果，并携带 UID 游标信息。"""
+
+    def __init__(
+        self,
+        items=None,
+        *,
+        max_uid: int = 0,
+        failed_uids=None,
+        uid_validity: Optional[int] = None,
+        scan_ok: bool = True,
+        uid_reset: bool = False,
+    ):
+        super().__init__(items or [])
+        self.max_uid = int(max_uid or 0)
+        self.failed_uids = list(failed_uids or [])
+        self.uid_validity = uid_validity
+        self.scan_ok = bool(scan_ok)
+        self.uid_reset = bool(uid_reset)
+
+
 def decode_str(header_value: Optional[str]) -> str:
-    """
-    解码邮件头部字段（如 Subject、From），防止乱码
-    """
+    """解码邮件头部字段（如 Subject、From），防止乱码。"""
     if not header_value:
         return ""
     decoded_fragments = decode_header(header_value)
@@ -40,10 +61,7 @@ def decode_str(header_value: Optional[str]) -> str:
 
 
 def extract_email_address(from_header: str) -> str:
-    """
-    从 From 头中提取出纯邮箱地址
-    例如: "张三 <zhangsan@company.com>" -> "zhangsan@company.com"
-    """
+    """从 From 头中提取纯邮箱地址。"""
     match = re.search(r"[\w\.-]+@[\w\.-]+", from_header)
     return match.group(0).lower() if match else from_header.lower()
 
@@ -64,8 +82,47 @@ def has_required_recipients(message: Message, required_recipients: set) -> bool:
     return normalized_required.issubset(extract_recipient_addresses(message))
 
 
+def _create_imap_client(host: str, port: int, use_ssl: bool, timeout: float):
+    """创建带连接超时的 IMAP 客户端，兼容不支持 timeout 参数的 Python 版本。"""
+    if use_ssl:
+        class TimeoutIMAP4SSL(imaplib.IMAP4_SSL):
+            def _create_socket(self, *args, **kwargs):
+                sock = socket.create_connection((self.host, self.port), timeout=timeout)
+                return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+        return TimeoutIMAP4SSL(host, port)
+
+    class TimeoutIMAP4(imaplib.IMAP4):
+        def _create_socket(self, *args, **kwargs):
+            return socket.create_connection((self.host, self.port), timeout=timeout)
+
+    return TimeoutIMAP4(host, port)
+
+
+def _get_uid_validity(mail: imaplib.IMAP4) -> Optional[int]:
+    """读取当前邮箱目录 UIDVALIDITY，用于检测 UID 序列是否被服务器重置。"""
+    try:
+        _, values = mail.response("UIDVALIDITY")
+        if not values:
+            return None
+        raw = values[-1]
+        text = raw.decode("ascii", errors="ignore") if isinstance(raw, bytes) else str(raw)
+        match = re.search(r"\d+", text)
+        return int(match.group(0)) if match else None
+    except Exception:
+        return None
+
+
+def _cleanup_message_dir(message_dir: Path):
+    try:
+        if message_dir.exists():
+            shutil.rmtree(message_dir)
+    except Exception:
+        pass
+
+
 class IMAPMailListener:
-    """IMAP 邮件监听器"""
+    """IMAP 邮件监听器。"""
 
     def __init__(self, config: Dict):
         self.host = config.get("imap_host", "127.0.0.1")
@@ -74,21 +131,26 @@ class IMAPMailListener:
         self.username = config.get("username", "")
         self.password = config.get("password", "")
         self.folder = config.get("folder", "Sent")
+        self.timeout = float(config.get("timeout_seconds", 10))
 
     def connect(self) -> Optional[imaplib.IMAP4]:
-        """
-        连接并登录 IMAP 服务器
-        """
+        """连接并登录 IMAP 服务器。"""
         try:
-            if self.use_ssl:
-                mail = imaplib.IMAP4_SSL(self.host, self.port)
-            else:
-                mail = imaplib.IMAP4(self.host, self.port)
-
+            mail = _create_imap_client(
+                self.host,
+                self.port,
+                self.use_ssl,
+                self.timeout,
+            )
+            if getattr(mail, "sock", None) is not None:
+                mail.sock.settimeout(self.timeout)
             mail.login(self.username, self.password)
             return mail
-        except Exception as e:
-            logger.error(f"IMAP 连接/登录失败 [{self.host}:{self.port}]: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error(
+                f"IMAP 连接/登录失败 [{self.host}:{self.port}]: {exc}",
+                exc_info=True,
+            )
             return None
 
     def fetch_unprocessed_emails(
@@ -96,149 +158,221 @@ class IMAPMailListener:
         processed_message_ids: set,
         filter_rules: Dict[str, Any],
         temp_dir: Path,
+        last_uid: int = 0,
+        expected_uid_validity: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
-        拉取并解析符合过滤规则且未处理过的邮件
-        :return: 邮件信息列表，包含附件路径
+        使用 IMAP UID 增量拉取并解析符合规则且未处理过的邮件。
+
+        返回值保持 list 兼容，同时携带 max_uid、failed_uids、uid_validity、scan_ok 等属性。
         """
         mail = self.connect()
         if not mail:
-            return []
+            return MailFetchResult(scan_ok=False, max_uid=last_uid)
 
-        results = []
+        results = MailFetchResult(max_uid=last_uid)
         try:
-            # 选择监控的文件夹 (如 "Sent" 或 "INBOX")
             status, _ = mail.select(f'"{self.folder}"', readonly=True)
             if status != "OK":
-                # 尝试未带双引号形式
                 status, _ = mail.select(self.folder, readonly=True)
-                if status != "OK":
-                    logger.warning(f"无法打开邮件文件夹 [{self.folder}]，尝试打开 [INBOX]")
-                    mail.select("INBOX", readonly=True)
+            if status != "OK":
+                logger.warning(f"无法打开邮件文件夹 [{self.folder}]，尝试打开 [INBOX]")
+                status, _ = mail.select("INBOX", readonly=True)
+            if status != "OK":
+                logger.error(f"无法打开邮件文件夹 [{self.folder}] 或 [INBOX]")
+                results.scan_ok = False
+                return results
 
-            # 搜索全部邮件 ID（可根据需要调整搜索范围，如最近 50 封）
-            status, data = mail.search(None, "ALL")
-            if status != "OK" or not data or not data[0]:
-                mail.logout()
-                return []
+            uid_validity = _get_uid_validity(mail)
+            results.uid_validity = uid_validity
 
-            email_ids = data[0].split()
-            # 获取最近的 30 封邮件，倒序处理
-            recent_ids = email_ids[-30:]
-            recent_ids.reverse()
+            start_uid = max(int(last_uid or 0) + 1, 1)
+            if (
+                expected_uid_validity is not None
+                and uid_validity is not None
+                and int(expected_uid_validity) != int(uid_validity)
+            ):
+                logger.warning(
+                    "检测到 IMAP UIDVALIDITY 变化 (%s -> %s)，将从 UID 1 重新扫描；"
+                    "已处理 Message-ID 仍会用于防重",
+                    expected_uid_validity,
+                    uid_validity,
+                )
+                start_uid = 1
+                results.uid_reset = True
 
-            keywords = [kw.lower() for kw in filter_rules.get("subject_keywords", ["周报"])]
-            allowed_senders = [s.lower() for s in filter_rules.get("allowed_senders", [])]
+            status, data = mail.uid("search", None, "UID", f"{start_uid}:*")
+            if status != "OK":
+                logger.error(f"IMAP UID SEARCH 失败，起始 UID: {start_uid}")
+                results.scan_ok = False
+                return results
+
+            uid_values = data[0].split() if data and data[0] else []
+            uid_numbers = []
+            for raw_uid in uid_values:
+                try:
+                    uid_numbers.append(int(raw_uid))
+                except (TypeError, ValueError):
+                    logger.warning(f"忽略无法解析的 IMAP UID: {raw_uid!r}")
+
+            if uid_numbers:
+                results.max_uid = max(uid_numbers)
+
+            keywords = [
+                kw.lower()
+                for kw in filter_rules.get("subject_keywords", ["周报"])
+            ]
+            allowed_senders = [
+                sender.lower()
+                for sender in filter_rules.get("allowed_senders", [])
+            ]
             required_recipients = {
                 address.lower()
                 for address in filter_rules.get("required_recipients", [])
             }
-            allowed_extensions = [ext.lower() for ext in filter_rules.get("allowed_extensions", [])]
+            allowed_extensions = [
+                ext.lower()
+                for ext in filter_rules.get("allowed_extensions", [])
+            ]
 
             temp_dir.mkdir(parents=True, exist_ok=True)
 
-            for eid in recent_ids:
-                status, msg_data = mail.fetch(eid, "(RFC822)")
-                if status != "OK" or not msg_data or not msg_data[0]:
-                    continue
+            # 必须按 UID 从小到大处理，便于失败时安全回退游标。
+            for uid in sorted(uid_numbers):
+                try:
+                    status, msg_data = mail.uid("fetch", str(uid), "(RFC822)")
+                    if status != "OK" or not msg_data:
+                        results.failed_uids.append(uid)
+                        logger.warning(f"读取 IMAP UID={uid} 失败，将在下一轮重试")
+                        continue
 
-                raw_email = msg_data[0][1]
-                msg = email.message_from_bytes(raw_email)
+                    raw_email = None
+                    for part in msg_data:
+                        if isinstance(part, tuple) and len(part) >= 2:
+                            raw_email = part[1]
+                            break
+                    if not raw_email:
+                        results.failed_uids.append(uid)
+                        logger.warning(f"IMAP UID={uid} 未返回 RFC822 正文，将在下一轮重试")
+                        continue
 
-                msg_id = msg.get("Message-ID", "").strip()
-                # 如果没有 Message-ID，则用 Date + Subject 作为唯一标识
-                subject = decode_str(msg.get("Subject", ""))
-                date_str = msg.get("Date", "")
-                unique_key = msg_id if msg_id else f"{date_str}_{subject}"
+                    msg = email.message_from_bytes(raw_email)
+                    msg_id = msg.get("Message-ID", "").strip()
+                    subject = decode_str(msg.get("Subject", ""))
+                    date_str = msg.get("Date", "")
+                    unique_key = msg_id if msg_id else f"{date_str}_{subject}"
 
-                if unique_key in processed_message_ids:
-                    continue
+                    if unique_key in processed_message_ids:
+                        continue
 
-                # 1. 检查主题关键词；附件名符合归档规则时也允许通过
-                subject_lower = subject.lower()
-                subject_matches = not keywords or any(kw in subject_lower for kw in keywords)
-
-                # 2. 检查发件人过滤
-                from_raw = decode_str(msg.get("From", ""))
-                sender_email = extract_email_address(from_raw)
-                if allowed_senders and sender_email not in allowed_senders:
-                    logger.info(f"发件人 [{sender_email}] 不在白名单列表中，跳过")
-                    continue
-
-                # 3. 最终分发邮件的 To/CC 必须包含全部指定收件组。
-                recipient_addresses = extract_recipient_addresses(msg)
-                missing_recipients = required_recipients - recipient_addresses
-                if not has_required_recipients(msg, required_recipients):
-                    logger.info(
-                        "邮件 [%s] 尚未发送给全部研发组，缺少: %s，跳过",
-                        subject,
-                        ", ".join(sorted(missing_recipients)),
+                    subject_lower = subject.lower()
+                    subject_matches = not keywords or any(
+                        keyword in subject_lower for keyword in keywords
                     )
-                    continue
 
-                logger.info(f"匹配到周报邮件: [{subject}], 发件人: [{from_raw}], Message-ID: [{unique_key}]")
-
-                # 4. 提取附件
-                attachments = []
-                attachment_name_matches = False
-                for part in msg.walk():
-                    if part.get_content_maintype() == "multipart":
-                        continue
-                    if part.get("Content-Disposition") is None:
+                    from_raw = decode_str(msg.get("From", ""))
+                    sender_email = extract_email_address(from_raw)
+                    if allowed_senders and sender_email not in allowed_senders:
+                        logger.info(f"发件人 [{sender_email}] 不在白名单列表中，跳过")
                         continue
 
-                    filename = part.get_filename()
-                    if not filename:
+                    recipient_addresses = extract_recipient_addresses(msg)
+                    missing_recipients = required_recipients - recipient_addresses
+                    if not has_required_recipients(msg, required_recipients):
+                        logger.info(
+                            "邮件 [%s] 尚未发送给全部研发组，缺少: %s，跳过",
+                            subject,
+                            ", ".join(sorted(missing_recipients)),
+                        )
                         continue
 
-                    filename = decode_str(filename)
-                    ext = Path(filename).suffix.lower()
+                    logger.info(
+                        "匹配到周报邮件: [%s], 发件人: [%s], Message-ID: [%s], UID: %s",
+                        subject,
+                        from_raw,
+                        unique_key,
+                        uid,
+                    )
 
-                    # 扩展名过滤
-                    if allowed_extensions and ext not in allowed_extensions:
-                        logger.info(f"附件 [{filename}] 格式不在白名单内，跳过")
-                        continue
-                    if parse_attachment_destination(filename):
-                        attachment_name_matches = True
+                    # 每封邮件使用独立临时目录，避免不同邮件中的同名附件互相覆盖。
+                    message_hash = hashlib.sha256(
+                        unique_key.encode("utf-8", errors="replace")
+                    ).hexdigest()[:24]
+                    message_temp_dir = temp_dir / message_hash
+                    message_temp_dir.mkdir(parents=True, exist_ok=True)
 
-                    # 保存附件到本地临时目录
-                    safe_filename = re.sub(r'[\\/*?:"<>|]', "_", filename)
-                    filepath = temp_dir / safe_filename
-                    try:
-                        payload = part.get_payload(decode=True)
-                        if payload:
-                            with open(filepath, "wb") as f:
-                                f.write(payload)
-                            attachments.append(filepath)
-                            logger.info(f"成功提取周报附件: {filename} ({len(payload)} bytes)")
-                    except Exception as e:
-                            logger.error(f"提取保存附件出错 [{filename}]: {e}", exc_info=True)
+                    attachments = []
+                    attachment_name_matches = False
+                    extraction_failed = False
+                    for part in msg.walk():
+                        if part.get_content_maintype() == "multipart":
+                            continue
+                        if part.get("Content-Disposition") is None:
+                            continue
 
-                if not subject_matches and not attachment_name_matches:
-                    logger.info(f"邮件 [{subject}] 的主题和附件名均不符合周会归档规则，跳过")
-                    for filepath in attachments:
+                        filename = part.get_filename()
+                        if not filename:
+                            continue
+
+                        filename = decode_str(filename)
+                        ext = Path(filename).suffix.lower()
+                        if allowed_extensions and ext not in allowed_extensions:
+                            logger.info(f"附件 [{filename}] 格式不在白名单内，跳过")
+                            continue
+                        if parse_attachment_destination(filename):
+                            attachment_name_matches = True
+
+                        safe_filename = re.sub(r'[\\/*?:"<>|]', "_", filename)
+                        filepath = message_temp_dir / safe_filename
                         try:
-                            filepath.unlink()
-                        except Exception:
-                            pass
-                    continue
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                with open(filepath, "wb") as file_obj:
+                                    file_obj.write(payload)
+                                attachments.append(filepath)
+                                logger.info(
+                                    f"成功提取周报附件: {filename} ({len(payload)} bytes)"
+                                )
+                        except Exception as exc:
+                            extraction_failed = True
+                            logger.error(
+                                f"提取保存附件出错 [{filename}]: {exc}",
+                                exc_info=True,
+                            )
 
-                results.append({
-                    "unique_key": unique_key,
-                    "subject": subject,
-                    "from": from_raw,
-                    "sender_email": sender_email,
-                    "recipients": sorted(recipient_addresses),
-                    "date": date_str,
-                    "attachments": attachments,
-                })
+                    if not subject_matches and not attachment_name_matches:
+                        logger.info(
+                            f"邮件 [{subject}] 的主题和附件名均不符合周会归档规则，跳过"
+                        )
+                        _cleanup_message_dir(message_temp_dir)
+                        continue
 
-            mail.logout()
-        except Exception as e:
-            logger.error(f"检索邮件过程中发生异常: {e}", exc_info=True)
+                    results.append({
+                        "uid": uid,
+                        "unique_key": unique_key,
+                        "subject": subject,
+                        "from": from_raw,
+                        "sender_email": sender_email,
+                        "recipients": sorted(recipient_addresses),
+                        "date": date_str,
+                        "attachments": attachments,
+                        "temp_dir": message_temp_dir,
+                        "extraction_failed": extraction_failed,
+                    })
+                except Exception as exc:
+                    results.failed_uids.append(uid)
+                    logger.error(
+                        f"解析 IMAP UID={uid} 邮件发生异常，将在下一轮重试: {exc}",
+                        exc_info=True,
+                    )
+
+            return results
+        except Exception as exc:
+            results.scan_ok = False
+            logger.error(f"检索邮件过程中发生异常: {exc}", exc_info=True)
+            return results
+        finally:
             try:
                 mail.logout()
             except Exception:
                 pass
-
-        return results
