@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Set
+from typing import Any, Dict
 
 from common.config_loader import get_project_root
 from services.weekly_report_sync.filename_rules import parse_attachment_destination
@@ -43,55 +43,34 @@ def _empty_sync_state() -> Dict[str, Any]:
 
 
 def load_sync_state(history_file_path: Path) -> Dict[str, Any]:
-    """加载同步状态，并自动兼容旧版仅保存 Message-ID 列表的 JSON 文件。"""
-    state = _empty_sync_state()
+    """加载新版 JSON 同步状态；不兼容旧版 Message-ID 列表格式。"""
     if not history_file_path.exists():
-        return state
+        return _empty_sync_state()
 
     try:
         with open(history_file_path, "r", encoding="utf-8") as file_obj:
             data = json.load(file_obj)
 
-        # v1: ["message-id-1", "message-id-2", ...]
-        if isinstance(data, list):
-            state["processed_messages"] = {
-                str(message_id): {"processed_at": ""}
-                for message_id in data
-                if message_id
-            }
-            logger.info(
-                "检测到旧版邮件处理历史，将自动迁移为 UID/附件级 JSON 状态格式"
+        if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
+            logger.warning(
+                "同步状态文件格式不是当前版本，将忽略旧状态并从头建立: %s",
+                history_file_path,
             )
-            return state
+            return _empty_sync_state()
 
-        if not isinstance(data, dict):
-            return state
-
+        state = _empty_sync_state()
         state["last_uid"] = int(data.get("last_uid", 0) or 0)
         state["uid_validity"] = data.get("uid_validity")
 
-        processed = data.get("processed_messages", {})
-        if isinstance(processed, list):
-            processed = {
-                str(message_id): {"processed_at": ""}
-                for message_id in processed
-                if message_id
-            }
-        if isinstance(processed, dict):
-            state["processed_messages"] = processed
-
-        attachments = data.get("attachments", {})
-        if isinstance(attachments, dict):
-            state["attachments"] = attachments
-
-        notifications = data.get("notifications", {})
-        if isinstance(notifications, dict):
-            state["notifications"] = notifications
+        for key in ("processed_messages", "attachments", "notifications"):
+            value = data.get(key, {})
+            if isinstance(value, dict):
+                state[key] = value
 
         return state
     except Exception as exc:
         logger.warning(f"读取同步状态文件出错 [{history_file_path}]: {exc}")
-        return state
+        return _empty_sync_state()
 
 
 def save_sync_state(history_file_path: Path, state: Dict[str, Any]):
@@ -121,20 +100,6 @@ def save_sync_state(history_file_path: Path, state: Dict[str, Any]):
         temp_path.replace(history_file_path)
     except Exception as exc:
         logger.error(f"保存同步状态失败 [{history_file_path}]: {exc}", exc_info=True)
-
-
-# 保留旧函数名，避免现有调用方或测试依赖旧接口。
-def load_processed_history(history_file_path: Path) -> Set[str]:
-    return set(load_sync_state(history_file_path).get("processed_messages", {}))
-
-
-def save_processed_history(history_file_path: Path, processed_set: Set[str]):
-    state = load_sync_state(history_file_path)
-    state["processed_messages"] = {
-        str(message_id): {"processed_at": _now_text()}
-        for message_id in processed_set
-    }
-    save_sync_state(history_file_path, state)
 
 
 def get_date_context() -> Dict[str, str]:
