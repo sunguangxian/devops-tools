@@ -3,19 +3,20 @@
 #
 # 使用说明：
 # 1. 复制此文件为 weekly_report_sync.yaml:
-#    cp config/weekly_report_sync.example.yaml config/weekly_report_sync.yaml
+#    copy config\weekly_report_sync.example.yaml config\weekly_report_sync.yaml
 # 2. 填写实际的邮箱凭证、邮件过滤规则和 SeedDMS 登录信息
 # 3. 注意：weekly_report_sync.yaml 会被 .gitignore 忽略，保护密码安全！
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 1. hMailServer 邮件监听配置 (IMAP 轮询监控)
+# 1. hMailServer 邮件监听配置 (IMAP UID 增量轮询)
 # ------------------------------------------------------------------------------
 mail_monitor:
   # hMailServer IMAP 服务配置 (同机通常为 127.0.0.1)
   imap_host: "127.0.0.1"
-  imap_port: 143                   # 常用端口: 143 (明文/STARTTLS) 或 993 (SSL)
+  imap_port: 143                   # 常用端口: 143 (明文) 或 993 (SSL)
   use_ssl: false
+  timeout_seconds: 10             # IMAP 建连和读写超时，避免后台线程长期卡死
 
   # 监控的邮箱账号与密码（推荐监控发件人自己的发件箱 Sent，或者专用归档邮箱）
   username: "report_sender@company.com"
@@ -88,8 +89,22 @@ notification:
   subject: "周会纪要自动归档完成"
 
 # ------------------------------------------------------------------------------
-# 5. 本地临时缓存与已处理记录配置
+# 5. HTTP 手工触发保护
+# ------------------------------------------------------------------------------
+manual_trigger:
+  enabled: true
+  # POST /sync/weekly_report 时必须在请求头携带: X-API-Key: <此值>
+  # 生产环境请改成足够长的随机字符串，不要使用示例值。
+  api_key: "replace-with-a-long-random-api-key"
+
+# ------------------------------------------------------------------------------
+# 6. 本地临时缓存与同步状态
 # ------------------------------------------------------------------------------
 storage:
-  temp_dir: "./data/temp_attachments"          # 附件临时保存提取目录
-  history_file: "./data/processed_emails.json" # 已处理邮件 Message-ID 记录文件（防止重复归档）
+  # 每封邮件会在此目录下使用独立子目录保存附件，避免同名附件互相覆盖。
+  temp_dir: "./data/temp_attachments"
+
+  # 仍然使用 JSON，不引入数据库。
+  # 文件中会保存：last_uid、UIDVALIDITY、已处理 Message-ID、附件 SHA256/重试状态、通知状态。
+  # 旧版仅包含 Message-ID 列表的 JSON 会在首次运行时自动兼容迁移。
+  history_file: "./data/processed_emails.json"
