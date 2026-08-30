@@ -1,12 +1,13 @@
 ' hMailServer EventHandlers.vbs 示例
-' 用途：在 OnDeliverMessage 中复制当前邮件快照到 devops-tools 本地队列，
-'       然后通知统一服务立即消费队列。
+' 用途：在 SMTP DATA 接收完成后的 OnAcceptMessage 中，把用户实际提交的邮件
+'       复制到 devops-tools 本地事件队列，再通知统一服务立即消费。
 '
-' 部署前请修改下面三个常量。
+' 部署前请修改下面三个配置值。
 
 Const DEVOPS_QUEUE_DIR = "C:\server-service\devops-tools\data\mail_event_queue"
 Const DEVOPS_EVENT_URL = "http://127.0.0.1:5000/event/hmailserver"
 Const DEVOPS_EVENT_KEY = "replace-with-a-long-random-event-api-key"
+Const DEVOPS_REQUIRE_AUTHENTICATED = True
 
 Sub EnsureFolder(ByVal folderPath)
     Dim fso, parentPath
@@ -24,8 +25,14 @@ Sub EnsureFolder(ByVal folderPath)
     End If
 End Sub
 
-Function BuildQueueBaseName(ByVal messageId)
-    Dim nowValue, stamp
+Function BuildQueueBaseName(ByVal sourcePath, ByVal sessionId)
+    Dim fso, sourceBase, nowValue, stamp
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    sourceBase = fso.GetBaseName(sourcePath)
+    sourceBase = Replace(sourceBase, "{", "")
+    sourceBase = Replace(sourceBase, "}", "")
+
     nowValue = Now
     stamp = Year(nowValue) _
         & Right("0" & Month(nowValue), 2) _
@@ -35,7 +42,8 @@ Function BuildQueueBaseName(ByVal messageId)
         & Right("0" & Minute(nowValue), 2) _
         & Right("0" & Second(nowValue), 2)
 
-    BuildQueueBaseName = CStr(messageId) & "_" & stamp
+    BuildQueueBaseName = sourceBase & "_" & CStr(sessionId) & "_" & stamp
+    Set fso = Nothing
 End Function
 
 Sub NotifyDevOpsService()
@@ -60,19 +68,25 @@ Sub NotifyDevOpsService()
     On Error GoTo 0
 End Sub
 
-Sub OnDeliverMessage(oMessage)
+Sub OnAcceptMessage(oClient, oMessage)
     On Error Resume Next
+
+    ' 对周报“发送后归档”的场景，默认只捕获经过 SMTP AUTH 的用户提交邮件。
+    ' 这样外部服务器投递到本机的普通来信不会进入归档队列。
+    If DEVOPS_REQUIRE_AUTHENTICATED Then
+        If Not oClient.Authenticated Then Exit Sub
+    End If
 
     Dim fso, baseName, tempPath, finalPath
     EnsureFolder DEVOPS_QUEUE_DIR
 
     Set fso = CreateObject("Scripting.FileSystemObject")
-    baseName = BuildQueueBaseName(oMessage.ID)
+    baseName = BuildQueueBaseName(oMessage.Filename, oClient.SessionID)
     tempPath = DEVOPS_QUEUE_DIR & "\" & baseName & ".tmp"
     finalPath = DEVOPS_QUEUE_DIR & "\" & baseName & ".eml"
 
-    ' 先完整复制到 .tmp，再原子式发布为 .eml。
-    ' Python 只扫描 *.eml，因此不会读到复制到一半的邮件。
+    ' 先完整复制到 .tmp，再发布为 .eml。
+    ' Python 只扫描 *.eml，不会读取正在复制的半成品。
     If fso.FileExists(tempPath) Then fso.DeleteFile tempPath, True
     fso.CopyFile oMessage.Filename, tempPath, True
 
@@ -91,7 +105,7 @@ Sub OnDeliverMessage(oMessage)
                 & "; target=" & finalPath
             Err.Clear
         Else
-            ' 即使 HTTP 通知失败，.eml 仍留在队列中，消费者会按 retry_interval_seconds 重试。
+            ' HTTP 通知失败也不会丢邮件：.eml 已留在队列中，Python 会定期重试。
             NotifyDevOpsService
         End If
     End If
