@@ -1,55 +1,48 @@
 # ==============================================================================
-# 周报自动归档至 SeedDMS 配置模板 (weekly_report_sync)
-#
-# 使用说明：
-# 1. 复制此文件为 weekly_report_sync.yaml:
-#    copy config\weekly_report_sync.example.yaml config\weekly_report_sync.yaml
-# 2. 填写实际的邮箱凭证、邮件过滤规则和 SeedDMS 登录信息
-# 3. 注意：weekly_report_sync.yaml 会被 .gitignore 忽略，保护密码安全！
+# hMailServer Event -> SeedDMS 自动归档配置模板
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 1. hMailServer 邮件监听配置 (IMAP UID 增量轮询)
+# 1. hMailServer Event 接入
 # ------------------------------------------------------------------------------
-mail_monitor:
-  # hMailServer IMAP 服务配置 (同机通常为 127.0.0.1)
-  imap_host: "127.0.0.1"
-  imap_port: 143                   # 常用端口: 143 (明文) 或 993 (SSL)
-  use_ssl: false
-  timeout_seconds: 10             # IMAP 建连和读写超时，避免后台线程长期卡死
+hmail_event:
+  enabled: true
 
-  # 第一次没有 UID 状态时只回看最近 N 封，避免把多年历史邮件重新归档。
-  # 建立状态后改为 UID 增量扫描，不再受此数量限制。0 表示首次扫描全部历史邮件。
-  initial_scan_limit: 30
+  # EventHandlers.vbs 会先把 oMessage.Filename 复制到这个目录。
+  # 如果使用相对路径，则相对于 devops-tools 项目根目录。
+  # EventHandlers.vbs 中建议填写对应的绝对路径。
+  queue_dir: "./data/mail_event_queue"
 
-  # 监控的邮箱账号与密码（推荐监控发件人自己的发件箱 Sent，或者专用归档邮箱）
-  username: "report_sender@company.com"
-  password: "your_email_password"
+  # hMailServer 调用 POST /event/hmailserver 时使用。
+  # 必须与 scripts/hmailserver/EventHandlers.example.vbs 中 DEVOPS_EVENT_KEY 一致。
+  api_key: "replace-with-a-long-random-event-api-key"
 
-  # 要监控的邮件文件夹名称（常见: "Sent", "Sent Messages", "已发送邮件", "INBOX"）
-  folder: "Sent"
+  # 默认只接受 127.0.0.1 / ::1 的事件通知。
+  allow_remote: false
 
-  # 自动轮询间隔（秒）- 作为后台服务运行时的检查频率
-  poll_interval_seconds: 60
+  # 正常情况下 Event HTTP 通知会立即唤醒消费者；
+  # 此间隔仅用于服务启动时遗留队列和 SeedDMS 上传失败后的自动重试。
+  retry_interval_seconds: 30
 
 # ------------------------------------------------------------------------------
 # 2. 周报邮件匹配与附件提取规则
 # ------------------------------------------------------------------------------
 filter_rules:
-  # 主题包含关键词，或附件名可解析出年份和类别时进行归档
+  # 建议明确填写真正用于发送周会/周报的邮箱。
+  # OnDeliverMessage 会看到 hMailServer 的所有投递邮件，配置白名单可以避免误归档外部来信。
+  allowed_senders:
+    - "report_sender@company.com"
+
+  # 主题包含关键词，或附件名本身符合归档命名规则时进入归档处理。
   subject_keywords:
     - "周会"
     - "会议纪要"
 
-  # 限制发件人邮箱（可选，为空表示不限制发件人）
-  allowed_senders: []
-
-  # 最终分发邮件的 To/CC 必须同时包含以下全部地址；为空表示不限制收件人
+  # 最终分发邮件 To/CC 必须同时包含以下全部地址；为空表示不限制。
   required_recipients:
     - "software_group@company.com"
     - "hardware_group@company.com"
 
-  # 支持归档的附件后缀名白名单
   allowed_extensions:
     - ".docx"
     - ".doc"
@@ -60,55 +53,48 @@ filter_rules:
     - ".zip"
 
 # ------------------------------------------------------------------------------
-# 3. SeedDMS 知识库归档配置
+# 3. SeedDMS 知识库归档
 # ------------------------------------------------------------------------------
 seeddms:
-  enabled: true                                # 是否开启 SeedDMS 归档
-  api_url: "http://seeddms.example.com:8080"   # SeedDMS Web 访问基础地址
-  username: "your_username"                    # SeedDMS 账号
-  password: "your_password"                    # SeedDMS 密码
-
-  # 目标归档父文件夹 ID（如周会目录: folderid=24）
+  enabled: true
+  api_url: "http://seeddms.example.com:8080"
+  username: "your_username"
+  password: "your_password"
   target_folder_id: 24
-
-  # 是否在目标目录下按年份自动分类（自动查找或创建如 '2026年' 子目录并归档）
   auto_create_year_folder: true
-
-  # 文档在 SeedDMS 中显示的标题；保留原附件名才能对同名文档自动新增版本
   document_name_template: "{filename}"
-
-  # 文档描述/备注
-  comment: "由邮件发送监控系统自动捕获并归档"
+  comment: "由 hMailServer Event 自动捕获并归档"
 
 # ------------------------------------------------------------------------------
 # 4. 归档完成邮件通知
 # ------------------------------------------------------------------------------
 notification:
   enabled: true
-  smtp_host: "127.0.0.1"             # hMailServer SMTP 地址
+  smtp_host: "127.0.0.1"
   smtp_port: 25
   use_ssl: false
   starttls: false
+
+  # SMTP 登录账号，已不再依赖 IMAP 配置。
+  username: "report_sender@company.com"
+  password: "your_email_password"
   recipient: "report_sender@company.com"
   subject: "周会纪要自动归档完成"
 
 # ------------------------------------------------------------------------------
-# 5. HTTP 手工触发保护
+# 5. HTTP 手工消费队列
 # ------------------------------------------------------------------------------
 manual_trigger:
   enabled: true
-  # POST /sync/weekly_report 时必须在请求头携带: X-API-Key: <此值>
-  # 生产环境请改成足够长的随机字符串，不要使用示例值。
-  api_key: "replace-with-a-long-random-api-key"
+  # POST /sync/weekly_report 请求头：X-API-Key: <此值>
+  api_key: "replace-with-a-long-random-manual-api-key"
 
 # ------------------------------------------------------------------------------
-# 6. 本地临时缓存与同步状态
+# 6. 本地缓存与 JSON 状态
 # ------------------------------------------------------------------------------
 storage:
-  # 每封邮件会在此目录下使用独立子目录保存附件，避免同名附件互相覆盖。
   temp_dir: "./data/temp_attachments"
-
-  # 仍然使用 JSON，不引入数据库。
-  # 文件中保存：last_uid、UIDVALIDITY、已处理 Message-ID、附件 SHA256/重试状态、通知状态。
-  # 新版本不兼容旧的 Message-ID 列表格式；升级时建议删除旧状态文件重新建立。
   history_file: "./data/processed_emails.json"
+
+  # Event 模式状态格式不兼容之前的 IMAP UID 状态。
+  # 切换到 Event 模式部署时直接删除旧 processed_emails.json 即可。
