@@ -1,8 +1,8 @@
-' hMailServer EventHandlers.vbs 示例
-' 用途：在 SMTP DATA 接收完成后的 OnAcceptMessage 中，把用户实际提交的邮件
-'       复制到 devops-tools 本地事件队列，再通知统一服务立即消费。
+' hMailServer EventHandlers.vbs example.
+' Copies authenticated SMTP submissions to the devops-tools event queue from
+' OnAcceptMessage, then sends a lightweight notification to the local service.
 '
-' 部署前请修改下面三个配置值。
+' Update these settings before deployment.
 
 Const DEVOPS_QUEUE_DIR = "C:\server-service\devops-tools\data\mail_event_queue"
 Const DEVOPS_EVENT_URL = "http://127.0.0.1:5000/event/hmailserver"
@@ -25,7 +25,7 @@ Sub EnsureFolder(ByVal folderPath)
     End If
 End Sub
 
-Function BuildQueueBaseName(ByVal sourcePath, ByVal sessionId)
+Function BuildQueueBaseName(ByVal sourcePath)
     Dim fso, sourceBase, nowValue, stamp
     Set fso = CreateObject("Scripting.FileSystemObject")
 
@@ -42,7 +42,7 @@ Function BuildQueueBaseName(ByVal sourcePath, ByVal sessionId)
         & Right("0" & Minute(nowValue), 2) _
         & Right("0" & Second(nowValue), 2)
 
-    BuildQueueBaseName = sourceBase & "_" & CStr(sessionId) & "_" & stamp
+    BuildQueueBaseName = sourceBase & "_" & stamp
     Set fso = Nothing
 End Function
 
@@ -71,22 +71,21 @@ End Sub
 Sub OnAcceptMessage(oClient, oMessage)
     On Error Resume Next
 
-    ' 对周报“发送后归档”的场景，默认只捕获经过 SMTP AUTH 的用户提交邮件。
-    ' 这样外部服务器投递到本机的普通来信不会进入归档队列。
+    ' Username is available on classic hMailServer releases after SMTP AUTH.
+    ' An empty username means that the SMTP session was not authenticated.
     If DEVOPS_REQUIRE_AUTHENTICATED Then
-        If Not oClient.Authenticated Then Exit Sub
+        If Len(Trim(CStr(oClient.Username))) = 0 Then Exit Sub
     End If
 
     Dim fso, baseName, tempPath, finalPath
     EnsureFolder DEVOPS_QUEUE_DIR
 
     Set fso = CreateObject("Scripting.FileSystemObject")
-    baseName = BuildQueueBaseName(oMessage.Filename, oClient.SessionID)
+    baseName = BuildQueueBaseName(oMessage.Filename)
     tempPath = DEVOPS_QUEUE_DIR & "\" & baseName & ".tmp"
     finalPath = DEVOPS_QUEUE_DIR & "\" & baseName & ".eml"
 
-    ' 先完整复制到 .tmp，再发布为 .eml。
-    ' Python 只扫描 *.eml，不会读取正在复制的半成品。
+    ' Publish only complete files. The Python worker scans *.eml, not *.tmp.
     If fso.FileExists(tempPath) Then fso.DeleteFile tempPath, True
     fso.CopyFile oMessage.Filename, tempPath, True
 
@@ -105,7 +104,7 @@ Sub OnAcceptMessage(oClient, oMessage)
                 & "; target=" & finalPath
             Err.Clear
         Else
-            ' HTTP 通知失败也不会丢邮件：.eml 已留在队列中，Python 会定期重试。
+            ' The queued .eml remains available for retry if notification fails.
             NotifyDevOpsService
         End If
     End If

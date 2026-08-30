@@ -61,7 +61,7 @@ OnAcceptMessage(oClient, oMessage)
 
 ### 为什么使用 OnAcceptMessage
 
-`OnAcceptMessage(oClient, oMessage)` 在 SMTP DATA 接收完成后触发，并能读取 `oClient.Authenticated`。示例脚本默认只捕获已经 SMTP AUTH 的用户提交邮件，因此外部邮件服务器投递到本机的普通来信不会进入归档队列。
+`OnAcceptMessage(oClient, oMessage)` 在 SMTP DATA 接收完成后触发。示例脚本通过经典版本也支持的 `oClient.Username` 判断 SMTP AUTH：认证成功后用户名非空。默认只捕获已认证用户提交的邮件，因此外部邮件服务器投递到本机的普通来信不会进入归档队列。
 
 与投递阶段的 `OnDeliverMessage` 相比，它更符合“用户发送邮件后归档”的语义，并避免外部投递重试导致同一邮件事件重复触发。
 
@@ -232,10 +232,10 @@ Sub OnAcceptMessage(oClient, oMessage)
 默认：
 
 ```vbscript
-If Not oClient.Authenticated Then Exit Sub
+If Len(Trim(CStr(oClient.Username))) = 0 Then Exit Sub
 ```
 
-因此主要捕获用户通过 SMTP AUTH 主动提交的邮件。
+因此主要捕获用户通过 SMTP AUTH 主动提交的邮件。示例 VBS 保持纯 ASCII，兼容旧版 Windows VBScript/hMailServer 脚本引擎；中文部署说明保留在本文档中。
 
 事件内不会直接访问 SeedDMS，只会：
 

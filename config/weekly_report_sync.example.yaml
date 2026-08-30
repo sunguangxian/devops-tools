@@ -28,7 +28,7 @@ hmail_event:
 # 2. 周报邮件匹配与附件提取规则
 # ------------------------------------------------------------------------------
 filter_rules:
-  # EventHandlers.vbs 默认只捕获 SMTP AUTH 成功的用户提交邮件；
+  # EventHandlers.vbs 通过非空 oClient.Username 判断 SMTP AUTH 成功；
   # 这里再限制真正用于发送周会/周报的邮箱，形成第二层过滤。
   allowed_senders:
     - "report_sender@company.com"
