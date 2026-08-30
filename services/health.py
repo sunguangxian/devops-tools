@@ -1,64 +1,44 @@
 # -*- coding: utf-8 -*-
 """统一服务依赖健康探测。"""
 
-import imaplib
-import socket
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import urljoin
 
 import requests
+
+from common.config_loader import get_project_root
 
 
 def _result(ok: bool, message: str) -> Dict[str, Any]:
     return {"ok": ok, "message": message}
 
 
-def _create_imap_client(host: str, port: int, use_ssl: bool, timeout: float):
-    """创建带网络超时的 IMAP 客户端，兼容 Python 3.8。"""
-    if use_ssl:
-        class TimeoutIMAP4SSL(imaplib.IMAP4_SSL):
-            def _create_socket(self):
-                sock = socket.create_connection((self.host, self.port), timeout=timeout)
-                return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
-
-        return TimeoutIMAP4SSL(host, port)
-
-    class TimeoutIMAP4(imaplib.IMAP4):
-        def _create_socket(self):
-            return socket.create_connection((self.host, self.port), timeout=timeout)
-
-    return TimeoutIMAP4(host, port)
+def _resolve_project_path(path_value: str) -> Path:
+    path = Path(path_value)
+    return path if path.is_absolute() else get_project_root() / path
 
 
-def probe_imap(mail_config: Dict[str, Any], timeout: float) -> Dict[str, Any]:
-    """验证 IMAP 端口、协议握手和邮箱凭证。"""
-    host = mail_config.get("imap_host", "")
-    port = int(mail_config.get("imap_port", 143))
-    username = mail_config.get("username", "")
-    password = mail_config.get("password", "")
-    if not host or not username or not password:
-        return _result(False, "IMAP 配置不完整")
+def probe_event_queue(config: Dict[str, Any]) -> Dict[str, Any]:
+    """验证 hMailServer Event 队列目录可创建、可写。"""
+    if not config.get("enabled", True):
+        return _result(True, "hMailServer Event 已禁用")
 
-    mail = None
+    queue_dir = _resolve_project_path(config.get("queue_dir", "./data/mail_event_queue"))
+    probe_file = queue_dir / ".healthcheck.tmp"
     try:
-        mail = _create_imap_client(
-            host,
-            port,
-            bool(mail_config.get("use_ssl", False)),
-            timeout,
-        )
-        mail.sock.settimeout(timeout)
-        mail.login(username, password)
-        return _result(True, "IMAP 登录正常")
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        probe_file.write_text("ok", encoding="ascii")
+        probe_file.unlink()
+        return _result(True, f"hMailServer Event 队列可写: {queue_dir}")
     except Exception as exc:
-        return _result(False, f"IMAP 登录失败: {exc}")
-    finally:
-        if mail is not None:
-            try:
-                mail.logout()
-            except Exception:
-                pass
+        try:
+            if probe_file.exists():
+                probe_file.unlink()
+        except Exception:
+            pass
+        return _result(False, f"hMailServer Event 队列不可写: {exc}")
 
 
 def probe_seeddms(config: Dict[str, Any], timeout: float) -> Dict[str, Any]:
@@ -123,11 +103,18 @@ def probe_dependencies(
     report_config: Dict[str, Any],
     timeout: float = 5,
 ) -> Dict[str, Dict[str, Any]]:
-    """并行探测三个外部依赖，避免健康接口串行累积等待。"""
+    """并行探测 Event 队列、SeedDMS 与 Redmine。"""
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            "imap": executor.submit(probe_imap, report_config.get("mail_monitor", {}), timeout),
-            "seeddms": executor.submit(probe_seeddms, report_config.get("seeddms", {}), timeout),
+            "hmail_event_queue": executor.submit(
+                probe_event_queue,
+                report_config.get("hmail_event", {}),
+            ),
+            "seeddms": executor.submit(
+                probe_seeddms,
+                report_config.get("seeddms", {}),
+                timeout,
+            ),
             "redmine": executor.submit(probe_redmine, git_config, timeout),
         }
         return {name: future.result() for name, future in futures.items()}
