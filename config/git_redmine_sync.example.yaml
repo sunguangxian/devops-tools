@@ -1,0 +1,38 @@
+# ==============================================================================
+# Git - Redmine 状态同步服务配置模板 (git_redmine_sync)
+#
+# 使用说明：
+# 1. 复制此文件为 git_redmine_sync.yaml:
+#    cp config/git_redmine_sync.example.yaml config/git_redmine_sync.yaml
+# 2. 在 git_redmine_sync.yaml 中填入实际的 Redmine 访问地址和用户 API Key
+# 3. 注意：*.yaml (除 *.example.yaml 外) 均被 .gitignore 忽略，切勿提交真实密钥到公开仓库！
+# ==============================================================================
+
+# Webhook HTTP 服务监听配置
+server:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+
+# Redmine 服务器访问地址
+redmine_url: "http://redmine.example.com:3000"
+
+# Redmine 状态名称（需与您 Redmine 系统中配置的问题状态名称完全一致）
+status:
+  resolved: "已解决"
+  closed: "已关闭"
+
+# 限制生效的分支列表（空列表 [] 表示对所有分支生效）
+# 示例: ["main", "master", "develop"]
+valid_branches: []
+
+# Git 用户名与 Redmine 用户 API Key 映射
+# 触发 Webhook 时将使用对应的 API Key 执行更新，使 Redmine 记录真实的提交人
+# Key 获取方式：Redmine 个人中心 -> 右侧“API访问键” -> 显示
+users:
+  git_username_1: "your_redmine_api_key_1"
+  git_username_2: "your_redmine_api_key_2"
+
+# 默认 Redmine API Key (可选)
+# 若配置，当提交者未在 users 列表中匹配到时将回退使用此 Key；若不配置则跳过未匹配用户的提交
+# default_api_key: "your_default_bot_api_key"
