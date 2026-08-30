@@ -8,7 +8,7 @@
 hmail_event:
   enabled: true
 
-  # EventHandlers.vbs 会先把 oMessage.Filename 复制到这个目录。
+  # EventHandlers.vbs 会在 OnAcceptMessage 中把 oMessage.Filename 复制到这个目录。
   # 如果使用相对路径，则相对于 devops-tools 项目根目录。
   # EventHandlers.vbs 中建议填写对应的绝对路径。
   queue_dir: "./data/mail_event_queue"
@@ -21,15 +21,15 @@ hmail_event:
   allow_remote: false
 
   # 正常情况下 Event HTTP 通知会立即唤醒消费者；
-  # 此间隔仅用于服务启动时遗留队列和 SeedDMS 上传失败后的自动重试。
+  # 此间隔只用于遗留队列和 SeedDMS 上传失败后的自动重试。
   retry_interval_seconds: 30
 
 # ------------------------------------------------------------------------------
 # 2. 周报邮件匹配与附件提取规则
 # ------------------------------------------------------------------------------
 filter_rules:
-  # 建议明确填写真正用于发送周会/周报的邮箱。
-  # OnDeliverMessage 会看到 hMailServer 的所有投递邮件，配置白名单可以避免误归档外部来信。
+  # EventHandlers.vbs 默认只捕获 SMTP AUTH 成功的用户提交邮件；
+  # 这里再限制真正用于发送周会/周报的邮箱，形成第二层过滤。
   allowed_senders:
     - "report_sender@company.com"
 
@@ -74,8 +74,6 @@ notification:
   smtp_port: 25
   use_ssl: false
   starttls: false
-
-  # SMTP 登录账号，已不再依赖 IMAP 配置。
   username: "report_sender@company.com"
   password: "your_email_password"
   recipient: "report_sender@company.com"
