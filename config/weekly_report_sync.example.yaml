@@ -18,6 +18,10 @@ mail_monitor:
   use_ssl: false
   timeout_seconds: 10             # IMAP 建连和读写超时，避免后台线程长期卡死
 
+  # 第一次没有 UID 状态时只回看最近 N 封，避免把多年历史邮件重新归档。
+  # 建立状态后改为 UID 增量扫描，不再受此数量限制。0 表示首次扫描全部历史邮件。
+  initial_scan_limit: 30
+
   # 监控的邮箱账号与密码（推荐监控发件人自己的发件箱 Sent，或者专用归档邮箱）
   username: "report_sender@company.com"
   password: "your_email_password"
@@ -105,6 +109,6 @@ storage:
   temp_dir: "./data/temp_attachments"
 
   # 仍然使用 JSON，不引入数据库。
-  # 文件中会保存：last_uid、UIDVALIDITY、已处理 Message-ID、附件 SHA256/重试状态、通知状态。
-  # 旧版仅包含 Message-ID 列表的 JSON 会在首次运行时自动兼容迁移。
+  # 文件中保存：last_uid、UIDVALIDITY、已处理 Message-ID、附件 SHA256/重试状态、通知状态。
+  # 新版本不兼容旧的 Message-ID 列表格式；升级时建议删除旧状态文件重新建立。
   history_file: "./data/processed_emails.json"
